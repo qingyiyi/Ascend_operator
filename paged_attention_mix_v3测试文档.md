@@ -2,9 +2,16 @@
 
 本文记录当前自研 `PagedAttentionMixV3` 与 ATB `_npu_paged_attention_splitfuse` 的测试环境准备、测试方法、正确性判断方式，以及一次固定规模下的 profiler 对比结果。
 
+## 0. 拉取测试仓库
+在宿主机上拉取测试仓库：
+```bash
+cd ~/var/
+git clone --recurse-submodules https://github.com/qingyiyi/Ascend_operator.git
+```
+
 ## 1. 创建 Docker 测试环境
 
-在宿主机上创建测试容器。用户目录只挂载 `~`，容器内映射为 `/root`，因此后续在容器中拉取的 `~/var` 会对应宿主机的 `$HOME/var`。
+在宿主机上创建测试容器。用户目录只挂载 `~`，容器内映射为 `/root`，因此后续在容器中拉取的 `~/var/Ascend_operator` 会对应宿主机的 `$HOME/var/Ascend_operator`。
 
 ```bash
 CROSSING_DOCKER_IMAGE=crossing_npu_benchmark:310p-aarch64-8.3.RC2-b92ca26
@@ -27,7 +34,7 @@ docker run -d --net=host --ipc=host \
         -v /var/queue_schedule:/var/queue_schedule \
         -v /usr/bin/hccn_tool:/usr/bin/hccn_tool \
         -v /etc/hccn.conf:/etc/hccn.conf \
-        -v $HOME:/root \
+        -v $HOME/var/Ascend_operator:/root/var/Ascend_operator \
         $CROSSING_DOCKER_IMAGE \
         tail -f /dev/null
 ```
@@ -38,25 +45,16 @@ docker run -d --net=host --ipc=host \
 docker exec -it $CONTAINER_NAME bash
 ```
 
-在容器内拉取测试仓库：
-
-```bash
-cd ~
-git clone --recurse-submodules https://github.com/qingyiyi/Ascend_operator.git
-```
-
 ## 2. 如何运行
 
-在测试目录执行：
+在测试目录执行下面命令即可开始测试：
 
 ```bash
-cd /root/Ascend_operator/test_op
-cd ..
+cd ~/var/Ascend_operator/test_op
 bash run.sh
 ```
 
 `run.sh` 当前会先编译自定义算子，然后执行：
-
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1 PROFILE_TARGET=both PROFILE_REPEAT=10 python test_attention.py
 ```
