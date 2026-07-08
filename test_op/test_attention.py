@@ -11,7 +11,7 @@ TEST_OP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(TEST_OP_DIR)
 EXTENSION_DIR = os.path.join(
     PROJECT_ROOT,
-    "customadd",
+    "custom_ops",
     "PagedAttentionMixV3",
     "torch_extension",
 )
