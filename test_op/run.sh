@@ -1,17 +1,17 @@
 
 # compiling prograss
 clear
-cd ~/var/custom_ops/PagedAttentionMixV3
+cd ~/Ascend_operator/custom_ops/PagedAttentionMixV3
 bash run.sh
-cd ~/var/test_op
+cd ~/Ascend_operator/test_op
 
 # runtime prograss
 #!/bin/bash
 rm -rf test_attention_cache/
-rm -rf /root/var/test_op/ascend_work
-rm -rf /root/var/test_op/printf
-mkdir -p /root/var/test_op/ascend_work
-chmod -R 777 /root/var/test_op/ascend_work
+rm -rf /root/Ascend_operator/test_op/ascend_work
+rm -rf /root/Ascend_operator/test_op/printf
+mkdir -p /root/Ascend_operator/test_op/ascend_work
+chmod -R 777 /root/Ascend_operator/test_op/ascend_work
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/8.3.RC2/opp/vendors/customize/bin/set_env.bash
@@ -22,7 +22,7 @@ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.3.RC2/opp/vendors/cust
 
 # export ASCEND_LAUNCH_BLOCKING=1
 # export ASCEND_SLOG_PRINT_TO_STDOUT=1
-export ASCEND_WORK_PATH=/root/var/test_op/ascend_work
+export ASCEND_WORK_PATH=/root/Ascend_operator/test_op/ascend_work
 
 echo "ASCEND_WORK_PATH=${ASCEND_WORK_PATH}"
 
