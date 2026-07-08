@@ -1,17 +1,18 @@
 
 # compiling prograss
 clear
-cd ~/Ascend_operator/custom_ops/PagedAttentionMixV3
+cd ../custom_ops/PagedAttentionMixV3
 bash run.sh
-cd ~/Ascend_operator/test_op
+cd ..
+cd ../test_op
 
 # runtime prograss
 #!/bin/bash
 rm -rf test_attention_cache/
-rm -rf /root/Ascend_operator/test_op/ascend_work
-rm -rf /root/Ascend_operator/test_op/printf
-mkdir -p /root/Ascend_operator/test_op/ascend_work
-chmod -R 777 /root/Ascend_operator/test_op/ascend_work
+rm -rf ascend_work/
+rm -rf printf
+mkdir -p ascend_work
+chmod -R 777 ascend_work
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/8.3.RC2/opp/vendors/customize/bin/set_env.bash
