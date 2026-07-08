@@ -16,6 +16,9 @@ chmod -R 777 /root/Ascend_operator/test_op/ascend_work
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/8.3.RC2/opp/vendors/customize/bin/set_env.bash
 
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 export ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/8.3.RC2/opp
 export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/ascend-toolkit/8.3.RC2/opp/vendors/customize
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/8.3.RC2/opp/vendors/customize/op_api/lib:${LD_LIBRARY_PATH}

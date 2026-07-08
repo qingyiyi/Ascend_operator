@@ -16,4 +16,3 @@
 !/test_op/run.sh
 !/test_op/test_attention.py
 !/test_op/diff_tensor.py
-!/test_op/ascend-transformer-boost/

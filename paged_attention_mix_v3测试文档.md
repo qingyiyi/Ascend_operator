@@ -42,7 +42,7 @@ docker exec -it $CONTAINER_NAME bash
 
 ```bash
 cd ~
-git clone https://github.com/qingyiyi/Ascend_operator.git
+git clone --recurse-submodules https://github.com/qingyiyi/Ascend_operator.git
 ```
 
 ## 2. 如何运行
@@ -51,6 +51,7 @@ git clone https://github.com/qingyiyi/Ascend_operator.git
 
 ```bash
 cd /root/Ascend_operator/test_op
+cd ..
 bash run.sh
 ```
 
