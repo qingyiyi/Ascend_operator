@@ -3,6 +3,8 @@
 
 # 保留 .gitignore 本身
 !/.gitignore
+!/paged_attention_mix_v3测试文档.md
+!/paged_attention_mix_v3开发文档.md
 
 # 保留整个 custom_ops 目录
 !/custom_ops/
