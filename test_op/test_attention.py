@@ -160,7 +160,8 @@ def make_query_nz(query_nd, q_lens, num_kv_heads):
     assert num_heads % num_kv_heads == 0
     assert sum(q_lens) == num_tokens
     assert head_dim % 16 == 0
-    return torch_npu.npu_format_cast(query_nd.contiguous(), 29)
+    query_head_major = query_nd.permute(1, 0, 2).contiguous()
+    return torch_npu.npu_format_cast(query_head_major, 29)
 
 
 def make_mask_nz(max_kv_len, kv_lens, q_lens):

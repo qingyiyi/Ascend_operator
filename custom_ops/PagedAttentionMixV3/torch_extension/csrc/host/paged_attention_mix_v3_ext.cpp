@@ -16,7 +16,7 @@ void CheckInputs(const at::Tensor &query,
                  const at::Tensor &kvLengths,
                  const at::Tensor &seqLenPerRequest)
 {
-    TORCH_CHECK(query.dim() == 3, "query must be [num_tokens, num_heads, head_size]");
+    TORCH_CHECK(query.dim() == 3, "query must be head-major NZ [num_heads, num_tokens_pad, head_size]");
     TORCH_CHECK(kCache.dim() == 4, "k_cache must be NZ [num_blocks, hidden_blocks, page_size, 16]");
     TORCH_CHECK(vCache.dim() == 4, "v_cache must be NZ [num_blocks, hidden_blocks, page_size, 16]");
     TORCH_CHECK(attentionMask.dim() == 4, "attention_mask must be NZ [1, mask_col_blocks, mask_rows_pad, 16]");
@@ -32,7 +32,8 @@ void CheckInputs(const at::Tensor &query,
     TORCH_CHECK(kvLengths.scalar_type() == at::kLong, "kv_lengths dtype must be int64");
     TORCH_CHECK(seqLenPerRequest.scalar_type() == at::kLong, "seq_len_per_request dtype must be int64");
 
-    TORCH_CHECK(query.size(1) > 0, "query num_heads must be positive");
+    TORCH_CHECK(query.size(0) > 0, "query num_heads must be positive");
+    TORCH_CHECK(query.size(1) > 0, "query num_tokens_pad must be positive");
     TORCH_CHECK(query.size(2) > 0, "query head_size must be positive");
     TORCH_CHECK(kCache.size(1) > 0, "k_cache hidden_blocks must be positive");
     TORCH_CHECK(kCache.size(2) > 0, "k_cache page_size must be positive");
@@ -44,8 +45,8 @@ void CheckInputs(const at::Tensor &query,
     TORCH_CHECK(attentionMask.size(2) > 0, "attention_mask NZ row pad must be positive");
     TORCH_CHECK(attentionMask.size(3) == 16, "attention_mask last NZ dim must be 16");
     TORCH_CHECK(attentionMask.size(2) % 16 == 0, "attention_mask NZ row pad must be aligned to 16");
-    TORCH_CHECK(attentionMask.size(2) >= query.size(0),
-                "attention_mask NZ row pad must cover query num_tokens");
+    TORCH_CHECK(attentionMask.size(2) >= query.size(1),
+                "attention_mask NZ row pad must cover query num_tokens_pad");
     TORCH_CHECK((kCache.size(1) * kCache.size(3)) % query.size(2) == 0,
                 "k_cache hidden size must be divisible by query head_size");
     const auto numKvHeads = (kCache.size(1) * kCache.size(3)) / query.size(2);
@@ -54,7 +55,7 @@ void CheckInputs(const at::Tensor &query,
                 "v_cache hidden size must be divisible by num_kv_heads");
     TORCH_CHECK(kCache.size(0) == vCache.size(0), "k_cache and v_cache must have the same num_blocks");
     TORCH_CHECK(kCache.size(2) == vCache.size(2), "k_cache and v_cache must have the same page_size");
-    TORCH_CHECK(query.size(1) % numKvHeads == 0, "query num_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(query.size(0) % numKvHeads == 0, "query num_heads must be divisible by num_kv_heads");
 }
 
 } // namespace
@@ -74,7 +75,7 @@ at::Tensor RunPagedAttentionMixV3(const at::Tensor &query,
 
     const auto numKvHeads = (kCache.size(1) * kCache.size(3)) / query.size(2);
     const auto vHeadSize = (vCache.size(1) * vCache.size(3)) / numKvHeads;
-    auto output = at::empty({query.size(0), query.size(1), vHeadSize}, query.options());
+    auto output = at::empty({query.size(1), query.size(0), vHeadSize}, query.options());
 
     at_npu::native::OpCommand cmd;
     cmd.Name("PagedAttentionMixV3")

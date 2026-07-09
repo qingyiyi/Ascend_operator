@@ -62,8 +62,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   }
   const float softmaxScale = *(attrs->GetFloat(0));
   //* 从context获取各个维度参数
-  const uint32_t numTokens = GetDim(context, 0, 0);
-  const uint32_t qHeadNum = GetDim(context, 0, 1);
+  const uint32_t qHeadNum = GetDim(context, 0, 0);
+  const uint32_t numTokensPad = GetDim(context, 0, 1);
   const uint32_t qkHeadSize = GetDim(context, 0, 2);
   const uint32_t kHiddenBlocks = GetDim(context, 1, 1);
   const uint32_t pageSize = GetDim(context, 1, 2);
@@ -84,11 +84,11 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   /************** for debug ****************/
   /*
   std::printf(
-      "[MixV3 tiling] numTokens=%u qHeadNum=%u qkHeadSize=%u "
+      "[MixV3 tiling] numTokensPad=%u qHeadNum=%u qkHeadSize=%u "
       "pageSize=%u kvHeadNum=%u kvHiddenSize=%u "
       "vPageSize=%u vHiddenSize=%u vHeadSize=%u "
       "maskColSize=%u pageNumPerBatch=%u softmaxScale=%f\n",
-      numTokens,
+      numTokensPad,
       qHeadNum,
       qkHeadSize,
       pageSize,
@@ -108,7 +108,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   // std::fflush(stdout);
   /************** for debug ****************/
 
-  if (numTokens == 0 || maskColSize == 0 || maskRowSize == 0 || pageNumPerBatch == 0) {
+  if (numTokensPad == 0 || maskColSize == 0 || maskRowSize == 0 || pageNumPerBatch == 0) {
     return ge::GRAPH_FAILED;
   }
   if (qHeadNum == 0 || kvHeadNum == 0 || qHeadNum % kvHeadNum != 0) {
@@ -141,6 +141,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   if (MissingConstTensor<int64_t>(kvLengths) || MissingConstTensor<int64_t>(seqLenPerRequest)) {
     context->SetBlockDim(1);
     tiling.set_batchSize(0);
+    tiling.set_numTokensPad(numTokensPad);
     tiling.set_qHeadNum(qHeadNum);
     tiling.set_qkHeadSize(qkHeadSize);
     tiling.set_kvHeadNum(kvHeadNum);
@@ -180,17 +181,17 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
       return ge::GRAPH_FAILED;
     }
     const uint32_t curSeqLen = static_cast<uint32_t>(seqLens[i]);
-    if (curSeqLen > numTokens - totalSeqLen) {
+    if (curSeqLen > numTokensPad - totalSeqLen) {
       return ge::GRAPH_FAILED;
     }
     totalSeqLen += curSeqLen;
     ++batchSize;
-    if (totalSeqLen == numTokens) 
+    if (totalSeqLen == numTokensPad)
     {
       break;
     }
   }
-  if (batchSize == 0 || totalSeqLen != numTokens) 
+  if (batchSize == 0 || totalSeqLen != numTokensPad)
   {
     return ge::GRAPH_FAILED;
   }
@@ -241,6 +242,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
   //* 将待传数据放在tiling中
   tiling.set_batchSize(batchSize);
+  tiling.set_numTokensPad(numTokensPad);
   tiling.set_qHeadNum(qHeadNum);
   tiling.set_qkHeadSize(qkHeadSize);
   tiling.set_kvHeadNum(kvHeadNum);
@@ -278,6 +280,11 @@ static ge::graphStatus InferShape(gert::InferShapeContext* context)
       return GRAPH_FAILED;
     }
     *outputShape = *queryShape;
+    if (queryShape->GetDimNum() >= 3) {
+      outputShape->SetDim(0, queryShape->GetDim(1));
+      outputShape->SetDim(1, queryShape->GetDim(0));
+      outputShape->SetDim(2, queryShape->GetDim(2));
+    }
     if (keyShape != nullptr && valueShape != nullptr && queryShape->GetDimNum() >= 3 &&
         keyShape->GetDimNum() >= 4 && valueShape->GetDimNum() >= 4) {
       const int64_t qHeadSize = queryShape->GetDim(2);

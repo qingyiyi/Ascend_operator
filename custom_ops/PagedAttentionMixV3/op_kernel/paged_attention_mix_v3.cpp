@@ -511,9 +511,9 @@ private:
         return QueryGroupNzElementCount(seqLen, qkHeadSize) * tilingData->kvHeadNum;
     }
 
-    //* query is passed as FORMAT_FRACTAL_NZ from the original [token, head, dim] Q.
-    //* GM physical order is [token][kBlock][head][c0]. This copy gathers the current
-    //* GQA head tile into the local folded-GQA NZ order: rows=(q_rows * gqa_tile), cols=head_dim.
+    //* query is passed as FORMAT_FRACTAL_NZ from head-major [head, token, dim] Q.
+    //* GM physical order is [head][kBlock][token][c0]. This copy keeps the local folded-GQA
+    //* NZ order used by BMM1: rows=(q_rows * gqa_tile), cols=head_dim.
     __aicore__ inline void CopyQueryToL1(uint32_t qTokenStart,
                                          uint32_t qHeadStart,
                                          uint32_t realQBlockRows,
@@ -522,29 +522,37 @@ private:
     {
         const uint32_t mSize = qBlockRows * gqaTileSize;
         const uint32_t qkHeadBlocks = qkHeadSize / CUBE_BLOCK_SIZE;
-        const uint32_t qHeadNum = tilingData->qHeadNum;
-        const uint32_t tokenStride = qHeadNum * qkHeadBlocks * CUBE_BLOCK_SIZE;    // 一个token占多少元素
-        const uint32_t blockLen = gqaTileSize * CUBE_BLOCK_SIZE * sizeof(DTYPE_QUERY) / DATA_BLOCK_BYTES;
-        const uint32_t srcStride = (tokenStride - gqaTileSize * CUBE_BLOCK_SIZE) *
+        const uint32_t numTokensPad = tilingData->numTokensPad;
+        const uint32_t headStride = numTokensPad * qkHeadSize;
+        const uint32_t kBlockStride = numTokensPad * CUBE_BLOCK_SIZE;
+        const uint32_t blockLen = CUBE_BLOCK_SIZE * sizeof(DTYPE_QUERY) / DATA_BLOCK_BYTES;
+        const uint32_t dstStride = (gqaTileSize - 1) * CUBE_BLOCK_SIZE *
                                    sizeof(DTYPE_QUERY) / DATA_BLOCK_BYTES;
         constexpr uint32_t DATA_COPY_PARAM_LIMIT = 65535;
 
-        if (qkHeadSize % CUBE_BLOCK_SIZE != 0 ||
+        if (gqaTileSize == 0 ||
+            qHeadStart + gqaTileSize > tilingData->qHeadNum ||
+            qkHeadSize % CUBE_BLOCK_SIZE != 0 ||
+            qTokenStart + realQBlockRows > numTokensPad ||
             realQBlockRows > DATA_COPY_PARAM_LIMIT ||
             blockLen > DATA_COPY_PARAM_LIMIT ||
-            srcStride > DATA_COPY_PARAM_LIMIT) {
+            dstStride > DATA_COPY_PARAM_LIMIT) {
             return;
         }
 
         for (uint32_t kBlock = 0; kBlock < qkHeadBlocks; ++kBlock) {
-            const uint32_t srcOffset = qTokenStart * tokenStride + kBlock * qHeadNum * CUBE_BLOCK_SIZE + qHeadStart * CUBE_BLOCK_SIZE;
-            const uint32_t dstOffset = kBlock * mSize * CUBE_BLOCK_SIZE;
-            AscendC::DataCopy(queryL1[dstOffset],
-                              queryNzGm[srcOffset],
-                              AscendC::DataCopyParams(static_cast<uint16_t>(realQBlockRows),
-                                                      static_cast<uint16_t>(blockLen),
-                                                      static_cast<uint16_t>(srcStride),
-                                                      0));
+            for (uint32_t tileHead = 0; tileHead < gqaTileSize; ++tileHead) {
+                const uint32_t qHeadId = qHeadStart + tileHead;
+                const uint32_t srcOffset =
+                    qHeadId * headStride + kBlock * kBlockStride + qTokenStart * CUBE_BLOCK_SIZE;
+                const uint32_t dstOffset = kBlock * mSize * CUBE_BLOCK_SIZE + tileHead * CUBE_BLOCK_SIZE;
+                AscendC::DataCopy(queryL1[dstOffset],
+                                  queryNzGm[srcOffset],
+                                  AscendC::DataCopyParams(static_cast<uint16_t>(realQBlockRows),
+                                                          static_cast<uint16_t>(blockLen),
+                                                          0,
+                                                          static_cast<uint16_t>(dstStride)));
+            }
         }
     }
 

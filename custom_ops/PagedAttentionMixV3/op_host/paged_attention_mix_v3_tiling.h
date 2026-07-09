@@ -7,6 +7,7 @@
 namespace optiling {
 BEGIN_TILING_DATA_DEF(PagedAttentionMixV3TilingData)
   TILING_DATA_FIELD_DEF(uint32_t, batchSize);
+  TILING_DATA_FIELD_DEF(uint32_t, numTokensPad);
   TILING_DATA_FIELD_DEF(uint32_t, qHeadNum);
   TILING_DATA_FIELD_DEF(uint32_t, qkHeadSize);
   TILING_DATA_FIELD_DEF(uint32_t, kvHeadNum);
