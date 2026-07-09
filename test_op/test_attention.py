@@ -33,6 +33,8 @@ torch.set_printoptions(
 
 def profile_targets():
     target = os.getenv("PROFILE_TARGET", "").lower()
+    if target in ("none", "null", "off", "false", "0"):
+        return target, False, False
     profile_mix_v3 = target in ("mix_v3", "both") or os.getenv("PROFILE_MIX_V3", "0") == "1"
     profile_atb = target in ("atb", "splitfuse", "both") or os.getenv("PROFILE_ATB", "0") == "1"
     return target, profile_mix_v3, profile_atb
@@ -369,7 +371,7 @@ def test_paged_attention(
 
 
 def main():
-    main_repeat = 1 if is_profile_enabled() else int(os.getenv("TEST_REPEAT", "10"))
+    main_repeat = 1 if is_profile_enabled() else int(os.getenv("TEST_REPEAT", "1"))
     for _ in range(main_repeat):
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [64, 192], [80, 432])
         # test_paged_attention(2, 2560, 5120, 96, 8, 128, 128)

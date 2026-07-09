@@ -32,8 +32,8 @@ echo "ASCEND_WORK_PATH=${ASCEND_WORK_PATH}"
 
 
 rm -rf profiler_attention/
-ASCEND_RT_VISIBLE_DEVICES=1 PROFILE_TARGET=both PROFILE_REPEAT=10 python test_attention.py
-# ASCEND_RT_VISIBLE_DEVICES=1 python test_attention.py
+# ASCEND_RT_VISIBLE_DEVICES=1 PROFILE_TARGET=both PROFILE_REPEAT=10 python test_attention.py
+ASCEND_RT_VISIBLE_DEVICES=1 PROFILE_TARGET=None PROFILE_REPEAT=1 python test_attention.py
 chmod -R 777 profiler_attention/
 
 # PROFILE_TARGET=mix_v3 PROFILE_REPEAT=10 python test_attention.py
