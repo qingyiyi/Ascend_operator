@@ -1414,9 +1414,6 @@ private:
             }
         }
         AscendC::PipeBarrier<PIPE_V>();
-        uint32_t shape[] = {dumpRows, colCount};
-        AscendC::ShapeInfo shapeInfo(2, shape);
-        AscendC::DumpTensor(workF16Ub, dumpId, dumpRows * colCount, shapeInfo);
     }
 
     __aicore__ inline void DumpC0Rows(AscendC::LocalTensor<float> src,
@@ -1448,9 +1445,6 @@ private:
             }
         }
         AscendC::PipeBarrier<PIPE_V>();
-        uint32_t shape[] = {dumpRows, colCount};
-        AscendC::ShapeInfo shapeInfo(2, shape);
-        AscendC::DumpTensor(workUb, dumpId, dumpRows * colCount, shapeInfo);
     }
 
     __aicore__ inline void MulRows(AscendC::LocalTensor<float> dst,
