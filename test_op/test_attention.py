@@ -374,7 +374,14 @@ def test_paged_attention(
 def main():
     main_repeat = 1 if is_profile_enabled() else int(os.getenv("TEST_REPEAT", "1"))
     for _ in range(main_repeat):
+        # P2 aligned regression.
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [64, 192], [80, 432])
+        # P3 actual-M/roundM tail regression: tail rows are 15 and 1.
+        test_paged_attention(2, 256, 512, 32, 4, 128, 128, [63, 193], [80, 432])
+        # Additional P3 tails after the core case is stable:
+        # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [1, 255], [80, 432])
+        # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [17, 239], [80, 432])
+        # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [127, 129], [160, 432])
         # test_paged_attention(2, 2560, 5120, 96, 8, 128, 128)
 
 
