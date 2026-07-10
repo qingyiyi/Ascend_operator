@@ -418,9 +418,9 @@ private:
         const uint32_t l1ValueBytes = l1ValueElements * sizeof(DTYPE_VCACHE);
         const uint32_t rowSize = mSize;
         const uint32_t maskSize = qBlockRows * kvTileSize;
-        const uint32_t workSize = Max(kvTileSize * CUBE_BLOCK_SIZE, mSize * CUBE_BLOCK_SIZE) + 8192;
+        const uint32_t workSize = Max(kvTileSize * CUBE_BLOCK_SIZE, mSize * CUBE_BLOCK_SIZE);
         const uint32_t ubBytes = (scoreSize + outSize + rowSize * 5 + workSize) * sizeof(float) +
-                            (scoreSize * 2 + outF16Size + rowSize * 4) * sizeof(half) +
+                            (scoreSize + outF16Size + rowSize * 4) * sizeof(half) +
                             maskSize * 2 * sizeof(DTYPE_ATTENTIONMASK);
         uint32_t ubOffset = 0;
 
@@ -448,8 +448,9 @@ private:
         ubOffset += scoreSize * sizeof(half);
         probUb = ubBase[ubOffset].ReinterpretCast<float>();
         ubOffset += scoreSize * sizeof(float);
-        probF16UbPing = ubBase[ubOffset].ReinterpretCast<half>();
-        ubOffset += scoreSize * sizeof(half);
+        // BuildProbFromScore consumes the full fp16 score into probUb before writing fp16
+        // probability, so the ping probability can safely overwrite the ping score slot.
+        probF16UbPing = scoreF16UbPing;
         outUb = ubBase[ubOffset].ReinterpretCast<float>();
         ubOffset += outSize * sizeof(float);
         outF16Ub = ubBase[ubOffset].ReinterpretCast<half>();
