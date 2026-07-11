@@ -54,6 +54,10 @@ constexpr auto PongflagPlus6 = EVENT_ID7;
 // R2+R3 has one physical owner even though mask/prob/PV use different logical tensors.
 // EVENT_ID7 is free for the V_MTE1/V_MTE2 event types used by this shared-arena guard.
 constexpr auto SharedUbFlag = EVENT_ID7;
+// outF16Ub aliases scoreF16UbPong. Protect the interval from the final output
+// MTE3 read until the next Vector reuse of the pong score slot without draining
+// every pipeline at the end of each task. EVENT_ID6 is free for MTE3_V.
+constexpr auto OutputReuseFlag = EVENT_ID6;
 }
 
 class PagedAttentionMixV3Kernel {
@@ -170,6 +174,10 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(PongflagPlus6);
         // The first shared-arena owner is always Softmax Ping's mask load (MTE1).
         AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
+        // Initially the pong score/output slot is free. Each output write returns
+        // this token only after MTE3 has finished reading outF16Ub.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
+        bool outputReusePending = true;
         
         for (uint32_t taskId = taskIdStart; taskId < taskIdEnd; ++taskId) {
             const uint32_t realQBlockRows = Min(qBlockRows, seqLen - qBlockStart);
@@ -270,6 +278,12 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
                         /****** ATB: Softmax Pong Starts ******/
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
+                        if (outputReusePending) {
+                            // scoreF16UbPong aliases the previous task's output source.
+                            // Delay only this first Vector reuse until MTE3 has read it.
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
+                            outputReusePending = false;
+                        }
                         SoftmaxPongSingle(historyKvLen + qBlockStart,
                                           pongTile.tilePageStart,
                                           realQBlockRows,
@@ -323,12 +337,19 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(Pongflag);
                 }
 
+                if (outputReusePending) {
+                    // A one-tile task never touched the pong score slot. Consume
+                    // the previous output token before casting into the alias.
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
+                    outputReusePending = false;
+                }
                 NormalizeAndWriteOutput((qBatchOffset + qBlockStart) * qHeadNum * vHeadSize +         //* 此时得到了总l，因此处理l得到最终的输出
                                             qHeadIdx * vHeadSize,
                                         mActual,
                                         roundM,
                                         qHeadNum,
                                         vHeadSize);
+                outputReusePending = true;
             }
 
             if (taskId + 1 >= taskIdEnd) {
@@ -390,6 +411,9 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(PongflagPlus2);
         // Consume the token returned by the final Update (or the initial token if there was no tile).
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
+        if (outputReusePending) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
+        }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -2046,7 +2070,10 @@ private:
                               0,
                               static_cast<uint16_t>((qHeadNum - 1) * vHeadSize *
                                                     sizeof(DTYPE_OUTPUT) / DATA_BLOCK_BYTES)));
-        AscendC::PipeBarrier<PIPE_ALL>();  //! 让当前 AICore 上所有 pipe 的前序操作都完成/可见后，再继续执行后面的操作   //!以硬件视角
+        // Return ownership of outF16Ub/scoreF16UbPong to Vector only after the
+        // asynchronous MTE3 write has consumed the source. The next task waits
+        // at its first actual reuse instead of draining every hardware pipe.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
     }
 
     __aicore__ inline void DivRows(AscendC::LocalTensor<float> dst,
