@@ -1113,6 +1113,32 @@ private:
                                    uint32_t gqaGroupSize,
                                    uint32_t pageSize)
     {
+        if (gqaGroupSize == 1) {
+            // Per-Q-head layout: score is [nBlock][roundM][C0], while mask is
+            // [nBlock][realQBlockRows][C0].  The old generic fallback emitted
+            // one 16-element Add for every row and N block.  Keep the same
+            // layout semantics, but add each contiguous matrix region at once.
+            if (realQBlockRows == roundM) {
+                AscendC::Add(scoreUb,
+                             scoreUb,
+                             maskUb,
+                             roundM * pageSize);
+            } else {
+                const uint32_t validBlockElements = realQBlockRows * CUBE_BLOCK_SIZE;
+                for (uint32_t nOffset = 0; nOffset < pageSize; nOffset += CUBE_BLOCK_SIZE) {
+                    const uint32_t blockIdx = nOffset / CUBE_BLOCK_SIZE;
+                    const uint32_t scoreOffset = blockIdx * roundM * CUBE_BLOCK_SIZE;
+                    const uint32_t maskOffset = blockIdx * realQBlockRows * CUBE_BLOCK_SIZE;
+                    AscendC::Add(scoreUb[scoreOffset],
+                                 scoreUb[scoreOffset],
+                                 maskUb[maskOffset],
+                                 validBlockElements);
+                }
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            return;
+        }
+
         if (gqaGroupSize == MAX_GQA_TILE_SIZE) {
             AscendC::BinaryRepeatParams gqa8AddParams(1, 1, 0, 8, 8, 1);
             const uint8_t repeat = static_cast<uint8_t>(realQBlockRows);
