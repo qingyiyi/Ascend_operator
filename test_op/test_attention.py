@@ -397,11 +397,19 @@ def main():
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [64, 192], [80, 432])
         # Non-16-aligned tails: 63 and 128+65 token slices.
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [63, 193], [80, 432])
-        # P4 boundary coverage, including the dedicated mActual == 1 path.
+        # P4 boundary coverage, including one-row tails inside aligned total-Q input.
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [127, 129], [160, 432])
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [129, 127], [432, 160])
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [1, 255], [80, 432])
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [17, 239], [80, 432])
+        # Decode regressions.  KV lengths 1/128/512 separate the one-row
+        # Q/output path from single-tile and multi-tile online-softmax behavior.
+        # The second positional argument is total Q tokens and must equal
+        # sum(seq_lengths_host), not the per-request qLen.
+        test_paged_attention(1, 1, 1, 32, 4, 128, 128, [1], [1])
+        test_paged_attention(1, 1, 128, 32, 4, 128, 128, [1], [128])
+        test_paged_attention(1, 1, 512, 32, 4, 128, 128, [1], [512])
+        test_paged_attention(2, 2, 512, 32, 4, 128, 128, [1, 1], [80, 432])
         # test_paged_attention(2, 2560, 5120, 96, 8, 128, 128)
 
 

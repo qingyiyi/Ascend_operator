@@ -621,9 +621,14 @@ private:
                                          uint32_t gqaTileSize)
     {
         const uint32_t qkHeadBlocks = qkHeadSize / CUBE_BLOCK_SIZE;
-        const uint32_t numTokensPad = tilingData->numTokensPad;
-        const uint32_t headStride = numTokensPad * qkHeadSize;
-        const uint32_t kBlockStride = numTokensPad * CUBE_BLOCK_SIZE;
+        // torch_npu physical FRACTAL_NZ pads the token/M storage stride to C0.
+        // Keep logical numTokens for bounds and token offsets, but use the padded
+        // physical row count between K blocks and Q heads.  This is observable for
+        // decode: logical [qHead, 1, headDim] has a 16-row physical head stride.
+        const uint32_t numTokens = tilingData->numTokensPad;
+        const uint32_t physicalTokenRows = RoundUp(numTokens, CUBE_BLOCK_SIZE);
+        const uint32_t headStride = physicalTokenRows * qkHeadSize;
+        const uint32_t kBlockStride = physicalTokenRows * CUBE_BLOCK_SIZE;
         const uint32_t blockLen = CUBE_BLOCK_SIZE * sizeof(DTYPE_QUERY) / DATA_BLOCK_BYTES;
         const uint32_t dstStride = (gqaTileSize - 1) * CUBE_BLOCK_SIZE *
                                    sizeof(DTYPE_QUERY) / DATA_BLOCK_BYTES;
@@ -632,30 +637,18 @@ private:
         if (gqaTileSize == 0 ||
             qHeadStart + gqaTileSize > tilingData->qHeadNum ||
             qkHeadSize % CUBE_BLOCK_SIZE != 0 ||
-            qTokenStart + realQBlockRows > numTokensPad ||
+            qTokenStart + realQBlockRows > numTokens ||
             realQBlockRows > DATA_COPY_PARAM_LIMIT ||
             blockLen > DATA_COPY_PARAM_LIMIT ||
             dstStride > DATA_COPY_PARAM_LIMIT) {
             return;
         }
 
-        // ASCEND_V200 MMAD has a dedicated M=1 A-matrix path. Match ATB by packing
-        // one C0 block from every K block into a contiguous L1 vector before LoadData.
-        if (realQBlockRows == 1 && gqaTileSize == 1) {
-            const uint32_t srcStride = numTokensPad - 1;
-            if (qkHeadBlocks > DATA_COPY_PARAM_LIMIT || srcStride > DATA_COPY_PARAM_LIMIT) {
-                return;
-            }
-            const uint32_t srcOffset =
-                qHeadStart * headStride + qTokenStart * CUBE_BLOCK_SIZE;
-            AscendC::DataCopy(queryL1,
-                              queryNzGm[srcOffset],
-                              AscendC::DataCopyParams(static_cast<uint16_t>(qkHeadBlocks),
-                                                      1,
-                                                      static_cast<uint16_t>(srcStride),
-                                                      0));
-            return;
-        }
+        // Keep M=1 in the same NZ layout as every other tail.  The previous
+        // packed-vector shortcut copied only the valid row from each K block and
+        // then relied on a VECTOR->VECTOR L1->L0A interpretation.  That sequence
+        // is not equivalent to the already-validated NZ->ZZ path in this AscendC
+        // implementation when the whole invocation contains only one Q row.
 
         for (uint32_t kBlock = 0; kBlock < qkHeadBlocks; ++kBlock) {
             for (uint32_t tileHead = 0; tileHead < gqaTileSize; ++tileHead) {
@@ -719,13 +712,9 @@ private:
                                           uint32_t mSize,
                                           uint32_t qkHeadSize)
     {   //* 这里由于输出设定为A2了，所以会自动转换成ZZ https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/API/ascendcopapi/atlasascendc_api_07_00169.html
-        if (mActual == 1) {
-            // ATB uses VECTOR -> VECTOR with one load repeat for the packed M=1 row.
-            AscendC::LoadData(dstQueryL0A,
-                              queryL1,
-                              AscendC::LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-            return;
-        }
+        (void)mActual;
+        // M=1 deliberately uses the normal roundM=16 NZ->ZZ load as well.  MMAD
+        // still receives m=1, so only row 0 contributes to the result.
 
         const uint32_t nzMBlockStride = CUBE_BLOCK_SIZE * CUBE_BLOCK_SIZE;
         for (uint32_t mOffset = 0; mOffset < mSize; mOffset += CUBE_BLOCK_SIZE) {    //? 这里是逐行拷贝到L0？
@@ -945,8 +934,13 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(mainFlag);
         AscendC::WaitFlag<AscendC::HardEvent::V_M>(mainFlag);
 
+        // Q/P use the normal roundM NZ->ZZ layout even when only one row is
+        // valid.  Avoid selecting the hardware M=1 packed-vector interpretation
+        // for that layout: execute one padded 16-row cube and discard rows 1..15
+        // in the later softmax/output stages.
+        const uint32_t cubeM = mActual == 1 ? CUBE_BLOCK_SIZE : mActual;
         AscendC::MmadParams qkMmadParams;
-        qkMmadParams.m = mActual;
+        qkMmadParams.m = cubeM;
         qkMmadParams.n = tileSize;
         qkMmadParams.k = qkHeadSize;
         qkMmadParams.cmatrixInitVal = true;
@@ -1712,8 +1706,11 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(plus2Flag);
         AscendC::WaitFlag<AscendC::HardEvent::V_M>(mainFlag);
 
+        // Match BMM1's padded-cube handling for the normal roundM P layout.
+        // Only row 0 is folded into online state and written when mActual == 1.
+        const uint32_t cubeM = mActual == 1 ? CUBE_BLOCK_SIZE : mActual;
         AscendC::MmadParams pvMmadParams;
-        pvMmadParams.m = mActual;
+        pvMmadParams.m = cubeM;
         pvMmadParams.n = vHeadSize;
         pvMmadParams.k = pageSize;
         pvMmadParams.cmatrixInitVal = true;
@@ -1840,18 +1837,9 @@ private:
                                         uint32_t mSize,
                                         uint32_t pageSize)
     {
-        if (mActual == 1) {
-            // Probability is NZ [nBlock][roundM][c0]. Pack row 0 from every
-            // N block contiguously, exactly as ATB's M=1 UB -> L1 path does.
-            AscendC::DataCopy(dstProbL1,
-                              probHalfUb,
-                              AscendC::DataCopyParams(
-                                  static_cast<uint16_t>(pageSize / CUBE_BLOCK_SIZE),
-                                  1,
-                                  static_cast<uint16_t>(mSize - 1),
-                                  0));
-            return;
-        }
+        (void)mActual;
+        // Preserve the full roundM NZ probability tile for M=1 instead of
+        // switching to a separately packed vector representation.
 
         AscendC::DataCopy(dstProbL1,
                           probHalfUb,
@@ -1868,13 +1856,8 @@ private:
                                          uint32_t mSize,
                                          uint32_t pageSize)
     {
-        if (mActual == 1) {
-            // Packed M=1 probability uses the same one-repeat VECTOR load as ATB.
-            AscendC::LoadData(dstProbL0A,
-                              srcProbL1,
-                              AscendC::LoadData2dParams(0, 1, 1, 0, 0, false, 0));
-            return;
-        }
+        (void)mActual;
+        // Use the same roundM NZ->ZZ path for the one-row probability matrix.
 
         for (uint32_t mOffset = 0; mOffset < mSize; mOffset += CUBE_BLOCK_SIZE) {
             AscendC::LoadData(dstProbL0A[mOffset * pageSize],
