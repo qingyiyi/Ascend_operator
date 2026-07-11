@@ -6,9 +6,12 @@ constexpr uint32_t VEC_SIZE_IN_BYTES = 8 * DATA_BLOCK_BYTES;
 constexpr uint32_t FLOATS_PER_VECTOR_REPEAT = VEC_SIZE_IN_BYTES / sizeof(float);
 constexpr uint32_t HALFS_PER_VECTOR_REPEAT = VEC_SIZE_IN_BYTES / sizeof(half);
 constexpr uint32_t CUBE_BLOCK_SIZE = 16;
-constexpr uint32_t Q_BLOCK_ROWS = CUBE_BLOCK_SIZE;
-constexpr uint32_t CUBE_MATRIX_SIZE = CUBE_BLOCK_SIZE * CUBE_BLOCK_SIZE;
+// The ND accumulator is the main layout difference from ATB's NZ goUbuf.
+// Keep every strided ND vector command within the already-verified P3 row span.
+constexpr uint32_t ND_ROW_REPEAT_CHUNK = CUBE_BLOCK_SIZE;
 constexpr uint32_t MAX_Q_ROWS_PER_GROUP = 128;
+constexpr uint32_t Q_BLOCK_ROWS = MAX_Q_ROWS_PER_GROUP;
+constexpr uint32_t CUBE_MATRIX_SIZE = CUBE_BLOCK_SIZE * CUBE_BLOCK_SIZE;
 constexpr uint32_t MAX_GQA_TILE_SIZE = 8;
 constexpr uint32_t KV_TILE_SIZE = 128;
 constexpr uint32_t MAX_V_HEAD_SIZE = 128;
@@ -18,8 +21,15 @@ constexpr uint32_t UB_SCORE_PONG_OFFSET = 1 * UB_REGION_BYTES;
 constexpr uint32_t UB_SHARED_OFFSET = 2 * UB_REGION_BYTES;
 constexpr uint32_t UB_ROW_STATE_OFFSET = 4 * UB_REGION_BYTES;
 constexpr uint32_t UB_WORK_OFFSET = 5 * UB_REGION_BYTES;
-constexpr uint32_t UB_OUTPUT_OFFSET = 6 * UB_REGION_BYTES;
-constexpr uint32_t UB_TOTAL_BYTES = 8 * UB_REGION_BYTES;
+// The largest vector workspace is 128 rows x 16 fp32 values = 8 KiB.
+// Do not assume ATB's raw-buffer top-of-UB layout is safe under AscendC TPipe.
+// On the current 310P build, outUb local row 112 starts at exactly 248 KiB and
+// is the only corrupted row in every 128-row slice. Pack output directly after
+// the actual workspace so the whole arena ends at 232 KiB.
+constexpr uint32_t UB_WORK_BYTES = MAX_Q_ROWS_PER_GROUP * CUBE_BLOCK_SIZE * sizeof(float);
+constexpr uint32_t UB_OUTPUT_OFFSET = UB_WORK_OFFSET + UB_WORK_BYTES;
+constexpr uint32_t UB_TOTAL_BYTES = UB_OUTPUT_OFFSET +
+                                    MAX_Q_ROWS_PER_GROUP * MAX_V_HEAD_SIZE * sizeof(float);
 constexpr float SOFTMAX_INIT_MIN = -65504.0F;
 
 static_assert(MAX_Q_ROWS_PER_GROUP * KV_TILE_SIZE * sizeof(half) <= UB_REGION_BYTES,
@@ -28,8 +38,10 @@ static_assert(MAX_Q_ROWS_PER_GROUP * KV_TILE_SIZE * sizeof(float) <= 2 * UB_REGI
               "fp32 score/PV scratch must fit in the shared 64 KiB UB arena");
 static_assert(MAX_Q_ROWS_PER_GROUP * MAX_V_HEAD_SIZE * sizeof(float) <= 2 * UB_REGION_BYTES,
               "persistent fp32 output must fit in the final 64 KiB UB arena");
-static_assert(UB_OUTPUT_OFFSET + 2 * UB_REGION_BYTES == UB_TOTAL_BYTES,
-              "fixed UB arena must be exactly 256 KiB");
+static_assert(UB_WORK_OFFSET + UB_WORK_BYTES <= UB_OUTPUT_OFFSET,
+              "vector workspace must not overlap persistent output");
+static_assert(UB_TOTAL_BYTES == 232 * 1024,
+              "packed UB arena must stay below the observed 248 KiB collision boundary");
 
 constexpr auto Pingflag = EVENT_ID0;
 constexpr auto Pongflag = EVENT_ID1;
@@ -505,7 +517,7 @@ private:
                         sharedScratchBytes <= 2 * UB_REGION_BYTES &&
                         maskBytes <= 2 * UB_REGION_BYTES &&
                         rowStateBytes <= UB_REGION_BYTES &&
-                        workBytes <= UB_REGION_BYTES &&
+                        workBytes <= UB_WORK_BYTES &&
                         outBytes <= 2 * UB_REGION_BYTES;
 
         pipe.InitBuffer(queryL0ABuf, 2 * l0aBytes);
@@ -563,7 +575,9 @@ private:
         rowOffset += rowSize * sizeof(float);
         lNewUb = ubBase[rowOffset].ReinterpretCast<float>();
 
-        // R5: vector workspace; R6+R7: cross-KV-tile fp32 output numerator.
+        // R5 low 8 KiB: vector workspace; the following packed 64 KiB:
+        // cross-KV-tile fp32 output numerator. Keeping it below 232 KiB avoids
+        // the observed 248 KiB address collision that corrupted local row 112.
         workUb = ubBase[UB_WORK_OFFSET].ReinterpretCast<float>();
         workF16Ub = ubBase[UB_WORK_OFFSET].ReinterpretCast<half>();
         outUb = ubBase[UB_OUTPUT_OFFSET].ReinterpretCast<float>();
@@ -1357,6 +1371,34 @@ private:
         AscendC::Adds(dst, src, 0.0F, count);
     }
 
+    __aicore__ inline void CastFloatToHalfChunked(AscendC::LocalTensor<half> dst,
+                                                  AscendC::LocalTensor<float> src,
+                                                  uint32_t count)
+    {
+        // ATB converts a full 128 x 128 output as two equal 128-repeat chunks.
+        // Keep the same bound here instead of issuing one 255-repeat conversion
+        // followed by a 1-repeat tail at the end of the UB arena.
+        constexpr uint32_t MAX_VECTOR_REPEAT_TIMES = 128;
+        uint32_t offset = 0;
+        while (offset + FLOATS_PER_VECTOR_REPEAT <= count) {
+            const uint32_t fullRepeat = Min(MAX_VECTOR_REPEAT_TIMES,
+                                            (count - offset) / FLOATS_PER_VECTOR_REPEAT);
+            AscendC::Cast<half, float, false>(dst[offset],
+                                              src[offset],
+                                              AscendC::RoundMode::CAST_NONE,
+                                              (uint64_t)0,
+                                              static_cast<uint8_t>(fullRepeat),
+                                              AscendC::UnaryRepeatParams(1, 1, 4, 8));
+            offset += fullRepeat * FLOATS_PER_VECTOR_REPEAT;
+        }
+        if (offset < count) {
+            AscendC::Cast(dst[offset],
+                          src[offset],
+                          AscendC::RoundMode::CAST_NONE,
+                          count - offset);
+        }
+    }
+
     __aicore__ inline uint8_t RepeatForC0Rows(uint32_t rowCount) const
     {
         return static_cast<uint8_t>(rowCount * CUBE_BLOCK_SIZE / HALFS_PER_VECTOR_REPEAT);
@@ -1599,12 +1641,28 @@ private:
         params.src1RepStride = 1;
 
         const uint32_t simdSize = VEC_SIZE_IN_BYTES / sizeof(float);
-        uint32_t colOffset = 0;
-        for (; colOffset + simdSize <= colCount; colOffset += simdSize) {
-            AscendC::Mul(dst[colOffset], src0[colOffset], src1, simdSize, rowCount, params);
-        }
-        if (colOffset < colCount) {
-            AscendC::Mul(dst[colOffset], src0[colOffset], src1, colCount - colOffset, rowCount, params);
+        const uint32_t broadcastBlockSize = DATA_BLOCK_BYTES / sizeof(float);
+        for (uint32_t rowStart = 0; rowStart < rowCount; rowStart += ND_ROW_REPEAT_CHUNK) {
+            const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, rowCount - rowStart));
+            const uint32_t rowOffset = rowStart * colCount;
+            const uint32_t scaleOffset = rowStart * broadcastBlockSize;
+            uint32_t colOffset = 0;
+            for (; colOffset + simdSize <= colCount; colOffset += simdSize) {
+                AscendC::Mul(dst[rowOffset + colOffset],
+                             src0[rowOffset + colOffset],
+                             src1[scaleOffset],
+                             simdSize,
+                             repeat,
+                             params);
+            }
+            if (colOffset < colCount) {
+                AscendC::Mul(dst[rowOffset + colOffset],
+                             src0[rowOffset + colOffset],
+                             src1[scaleOffset],
+                             colCount - colOffset,
+                             repeat,
+                             params);
+            }
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -1922,12 +1980,17 @@ private:
         addParams.src0RepStride = static_cast<uint16_t>(vHeadSize * sizeof(float) / DATA_BLOCK_BYTES);
         addParams.src1RepStride = static_cast<uint16_t>(CUBE_BLOCK_SIZE * sizeof(float) / DATA_BLOCK_BYTES);
         for (uint32_t nOffset = 0; nOffset < chunkCols; nOffset += CUBE_BLOCK_SIZE) {
-            AscendC::Add(outUb[chunkStart + nOffset],
-                         outUb[chunkStart + nOffset],
-                         pvUb[nOffset * roundM],
-                         CUBE_BLOCK_SIZE,
-                         mActual,
-                         addParams);    //* 写回UB，同时累加到总out上
+            for (uint32_t rowStart = 0; rowStart < mActual; rowStart += ND_ROW_REPEAT_CHUNK) {
+                const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, mActual - rowStart));
+                const uint32_t outOffset = rowStart * vHeadSize + chunkStart + nOffset;
+                const uint32_t pvOffset = nOffset * roundM + rowStart * CUBE_BLOCK_SIZE;
+                AscendC::Add(outUb[outOffset],
+                             outUb[outOffset],
+                             pvUb[pvOffset],
+                             CUBE_BLOCK_SIZE,
+                             repeat,
+                             addParams);    //* 写回UB，同时累加到总out上
+            }
         }
     }
 
@@ -1936,16 +1999,20 @@ private:
                                             uint32_t mActual,
                                             uint32_t vHeadSize)
     {
-        AscendC::Adds<float, false>(dst,
-                                    src,
-                                    0.0F,
-                                    (uint64_t)0,
-                                    static_cast<uint8_t>(mActual),
-                                    AscendC::UnaryRepeatParams(
-                                        1,
-                                        1,
-                                        static_cast<uint16_t>(vHeadSize * sizeof(float) / DATA_BLOCK_BYTES),
-                                        static_cast<uint16_t>(CUBE_BLOCK_SIZE * sizeof(float) / DATA_BLOCK_BYTES)));
+        const AscendC::UnaryRepeatParams copyParams(
+            1,
+            1,
+            static_cast<uint16_t>(vHeadSize * sizeof(float) / DATA_BLOCK_BYTES),
+            static_cast<uint16_t>(CUBE_BLOCK_SIZE * sizeof(float) / DATA_BLOCK_BYTES));
+        for (uint32_t rowStart = 0; rowStart < mActual; rowStart += ND_ROW_REPEAT_CHUNK) {
+            const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, mActual - rowStart));
+            AscendC::Adds<float, false>(dst[rowStart * vHeadSize],
+                                        src[rowStart * CUBE_BLOCK_SIZE],
+                                        0.0F,
+                                        (uint64_t)0,
+                                        repeat,
+                                        copyParams);
+        }
     }
 
     __aicore__ inline void NormalizeAndWriteOutput(uint32_t outputOffset,
@@ -1958,7 +2025,7 @@ private:
 
         DivRows(outUb, outUb, workUb, mActual, vHeadSize);       //* output = outUB / l0rgUB
 
-        AscendC::Cast(outF16Ub, outUb, AscendC::RoundMode::CAST_NONE, mActual * vHeadSize);
+        CastFloatToHalfChunked(outF16Ub, outUb, mActual * vHeadSize);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
@@ -2019,9 +2086,8 @@ private:
         params.src0RepStride = rowStride;
         params.src1RepStride = 1;
 
-        constexpr uint32_t MAX_VECTOR_REPEAT_TIMES = 255;
-        for (uint32_t rowStart = 0; rowStart < rowCount; rowStart += MAX_VECTOR_REPEAT_TIMES) {
-            const uint8_t repeat = static_cast<uint8_t>(Min(MAX_VECTOR_REPEAT_TIMES, rowCount - rowStart));
+        for (uint32_t rowStart = 0; rowStart < rowCount; rowStart += ND_ROW_REPEAT_CHUNK) {
+            const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, rowCount - rowStart));
             const uint32_t rowOffset = rowStart * colCount;
             const uint32_t divisorOffset = rowStart * broadcastBlockSize;
             uint32_t colOffset = 0;

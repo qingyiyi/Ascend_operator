@@ -189,6 +189,23 @@ def compare_outputs(name, out, ref, ref_name="ref", eps=1e-1):
     abs_error, rel_error, top_indices = compute_diff(out_np, ref_np, idx_cnt=20)
     print_diff(out_np, ref_np, name, ref_name, abs_error, rel_error, top_indices, eps=eps)
 
+    # P4 diagnostics: distinguish a whole 128-row slice failure from a tail or
+    # isolated head/dimension error. Keep this in the existing test only.
+    abs_diff = np.abs(out_np - ref_np)
+    if abs_diff.size != 0 and np.max(abs_diff) > eps:
+        reduce_axes = tuple(range(1, abs_diff.ndim))
+        row_max = np.max(abs_diff, axis=reduce_axes)
+        bad_rows = np.flatnonzero(row_max > eps)
+        first_bad = tuple(np.argwhere(abs_diff > eps)[0])
+        print(
+            f"first error > {eps}: index={first_bad}, "
+            f"{name}={out_np[first_bad]:.6f}, {ref_name}={ref_np[first_bad]:.6f}, "
+            f"abs_diff={abs_diff[first_bad]:.6f}"
+        )
+        print(f"bad token rows: first={int(bad_rows[0])}, last={int(bad_rows[-1])}, count={bad_rows.size}")
+        print("row max abs diff:")
+        print([(int(row), float(row_max[row])) for row in bad_rows])
+
 def create_inputs(
     num_batches,
     batch_seq_len,
@@ -374,14 +391,17 @@ def test_paged_attention(
 def main():
     main_repeat = 1 if is_profile_enabled() else int(os.getenv("TEST_REPEAT", "1"))
     for _ in range(main_repeat):
-        # P2 aligned regression.
+        # P4 exact 128-row slices with one visible KV tile.
+        test_paged_attention(2, 256, 512, 32, 4, 128, 128, [128, 128], [128, 128])
+        # P4 main multi-KV-tile regression: 64 and 128+64 token slices.
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [64, 192], [80, 432])
-        # P3 actual-M/roundM tail regression: tail rows are 15 and 1.
+        # Non-16-aligned tails: 63 and 128+65 token slices.
         test_paged_attention(2, 256, 512, 32, 4, 128, 128, [63, 193], [80, 432])
-        # Additional P3 tails after the core case is stable:
-        # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [1, 255], [80, 432])
-        # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [17, 239], [80, 432])
-        # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [127, 129], [160, 432])
+        # P4 boundary coverage, including the dedicated mActual == 1 path.
+        test_paged_attention(2, 256, 512, 32, 4, 128, 128, [127, 129], [160, 432])
+        test_paged_attention(2, 256, 512, 32, 4, 128, 128, [129, 127], [432, 160])
+        test_paged_attention(2, 256, 512, 32, 4, 128, 128, [1, 255], [80, 432])
+        test_paged_attention(2, 256, 512, 32, 4, 128, 128, [17, 239], [80, 432])
         # test_paged_attention(2, 2560, 5120, 96, 8, 128, 128)
 
 
