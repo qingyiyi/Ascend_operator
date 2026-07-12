@@ -13,6 +13,103 @@ constexpr uint32_t CUBE_BLOCK_SIZE = 16;
 constexpr uint32_t MAX_GQA_GROUP_SIZE = 16;
 constexpr uint32_t NZ_C0_SIZE = 16;
 constexpr uint32_t Q_BLOCK_ROWS = 128;
+constexpr uint32_t KV_TILE_SIZE = 128;
+constexpr uint32_t MAX_CORE_NUM = optiling::PAGED_ATTENTION_MIX_V3_MAX_CORE_NUM;
+
+uint32_t CeilDiv(uint32_t lhs, uint32_t rhs)
+{
+    return (lhs + rhs - 1) / rhs;
+}
+
+uint64_t GetSliceTaskWeight(uint32_t seqLen,
+                            uint32_t kvLen,
+                            uint32_t qSliceIdx,
+                            uint32_t pageSize,
+                            uint32_t kvTileSize,
+                            uint32_t tilesPerPage)
+{
+    const uint32_t qBlockStart = qSliceIdx * Q_BLOCK_ROWS;
+    const uint32_t realQBlockRows =
+        qBlockStart + Q_BLOCK_ROWS < seqLen ? Q_BLOCK_ROWS : seqLen - qBlockStart;
+    const uint32_t visibleKvEnd = kvLen - seqLen + qBlockStart + realQBlockRows;
+    const uint32_t fullPageNum = visibleKvEnd / pageSize;
+    const uint32_t tailInPage = visibleKvEnd - fullPageNum * pageSize;
+    const uint32_t visibleKvTileCount =
+        fullPageNum * tilesPerPage +
+        (tailInPage == 0 ? 0U : CeilDiv(tailInPage, kvTileSize));
+    return static_cast<uint64_t>(visibleKvTileCount) + 1U;
+}
+
+uint64_t GetPerHeadTaskWeight(uint32_t seqLen,
+                              uint32_t kvLen,
+                              uint32_t pageSize,
+                              uint32_t kvTileSize,
+                              uint32_t tilesPerPage)
+{
+    const uint32_t qSliceNum = CeilDiv(seqLen, Q_BLOCK_ROWS);
+    uint64_t perHeadWeight = 0;
+    for (uint32_t qSliceIdx = 0; qSliceIdx < qSliceNum; ++qSliceIdx) {
+        perHeadWeight += GetSliceTaskWeight(
+            seqLen, kvLen, qSliceIdx, pageSize, kvTileSize, tilesPerPage);
+    }
+    return perHeadWeight;
+}
+
+uint32_t FindWeightedTaskBoundary(uint64_t targetWeight,
+                                  const int64_t *seqLens,
+                                  const int64_t *kvLens,
+                                  uint32_t batchSize,
+                                  uint32_t qHeadNum,
+                                  uint32_t pageSize,
+                                  uint32_t kvTileSize,
+                                  uint32_t tilesPerPage,
+                                  uint32_t totalTaskNum)
+{
+    if (targetWeight == 0) {
+        return 0;
+    }
+
+    uint64_t weightBeforeBatch = 0;
+    uint32_t taskBase = 0;
+    for (uint32_t batchIdx = 0; batchIdx < batchSize; ++batchIdx) {
+        const uint32_t seqLen = static_cast<uint32_t>(seqLens[batchIdx]);
+        const uint32_t kvLen = static_cast<uint32_t>(kvLens[batchIdx]);
+        const uint32_t qSliceNum = CeilDiv(seqLen, Q_BLOCK_ROWS);
+        const uint64_t perHeadWeight = GetPerHeadTaskWeight(
+            seqLen, kvLen, pageSize, kvTileSize, tilesPerPage);
+        const uint64_t batchWeight = perHeadWeight * qHeadNum;
+        const uint32_t batchTaskNum = qSliceNum * qHeadNum;
+        if (targetWeight > weightBeforeBatch + batchWeight) {
+            weightBeforeBatch += batchWeight;
+            taskBase += batchTaskNum;
+            continue;
+        }
+
+        const uint64_t targetInBatch = targetWeight - weightBeforeBatch;
+        const uint32_t qHeadIdx = static_cast<uint32_t>(targetInBatch / perHeadWeight);
+        if (qHeadIdx >= qHeadNum) {
+            return taskBase + batchTaskNum;
+        }
+
+        const uint64_t targetInHead = targetInBatch - perHeadWeight * qHeadIdx;
+        uint64_t weightBeforeSlice = 0;
+        const uint32_t headTaskBase = taskBase + qHeadIdx * qSliceNum;
+        for (uint32_t qSliceIdx = 0; qSliceIdx < qSliceNum; ++qSliceIdx) {
+            const uint64_t sliceWeight = GetSliceTaskWeight(
+                seqLen, kvLen, qSliceIdx, pageSize, kvTileSize, tilesPerPage);
+            const uint64_t weightAfterSlice = weightBeforeSlice + sliceWeight;
+            if (targetInHead <= weightAfterSlice) {
+                const uint64_t distanceToPrevious = targetInHead - weightBeforeSlice;
+                const uint64_t distanceToNext = weightAfterSlice - targetInHead;
+                return headTaskBase + qSliceIdx +
+                       (distanceToNext < distanceToPrevious ? 1U : 0U);
+            }
+            weightBeforeSlice = weightAfterSlice;
+        }
+        return headTaskBase + qSliceNum;
+    }
+    return totalTaskNum;
+}
 
 template <typename T>
 bool MissingConstTensor(const gert::Tensor *tensor)
@@ -45,6 +142,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   }
 
   PagedAttentionMixV3TilingData tiling;
+  uint32_t taskStartPerCore[MAX_CORE_NUM] = {};
+  uint32_t taskEndPerCore[MAX_CORE_NUM] = {};
 
   const auto *attrs = context->GetAttrs();
   if (attrs == nullptr) {
@@ -143,6 +242,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tiling.set_maskRowSize(maskRowSize);
     tiling.set_gqaGroupSize(gqaGroupSize);
     tiling.set_usedCoreNum(1);
+    tiling.set_taskStartPerCore(taskStartPerCore);
+    tiling.set_taskEndPerCore(taskEndPerCore);
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     SetWorkspace(context);
@@ -206,8 +307,10 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   if (kvLenCount < static_cast<int64_t>(batchSize)) {
     return ge::GRAPH_FAILED;
   }
-  const uint32_t qBlockRows = Q_BLOCK_ROWS;
   uint64_t totalTaskNum = 0;
+  uint64_t totalTaskWeight = 0;
+  const uint32_t kvTileSize = pageSize < KV_TILE_SIZE ? pageSize : KV_TILE_SIZE;
+  const uint32_t tilesPerPage = CeilDiv(pageSize, kvTileSize);
   for (uint32_t i = 0; i < batchSize; ++i) {
     if (kvLens[i] <= 0 || kvLens[i] > std::numeric_limits<uint32_t>::max()) {
       return ge::GRAPH_FAILED;
@@ -221,14 +324,42 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     if (curKvPageNum > pageNumPerBatch) {
       return ge::GRAPH_FAILED;
     }
-    totalTaskNum += static_cast<uint64_t>((curSeqLen + qBlockRows - 1) / qBlockRows) * qHeadNum;
+    const uint32_t qSliceNum = CeilDiv(curSeqLen, Q_BLOCK_ROWS);
+    totalTaskNum += static_cast<uint64_t>(qSliceNum) * qHeadNum;
+    totalTaskWeight += GetPerHeadTaskWeight(
+        curSeqLen, curKvLen, pageSize, kvTileSize, tilesPerPage) * qHeadNum;
   }
+  if (totalTaskNum == 0 || totalTaskWeight == 0 ||
+      totalTaskNum > std::numeric_limits<uint32_t>::max()) {
+    return ge::GRAPH_FAILED;
+  }
+  const uint32_t totalTaskNumU32 = static_cast<uint32_t>(totalTaskNum);
 
   static auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
   const uint32_t coreNumAic = static_cast<uint32_t>(ascendcPlatform->GetCoreNumAic());
-  const uint32_t maxCoreNum = coreNumAic == 0 ? 1 : coreNumAic;
+  const uint32_t platformCoreNum = coreNumAic == 0 ? 1 : coreNumAic;
+  const uint32_t maxCoreNum = platformCoreNum < MAX_CORE_NUM ? platformCoreNum : MAX_CORE_NUM;
   const uint32_t usedCoreNum =
-      totalTaskNum == 0 ? 1 : static_cast<uint32_t>(totalTaskNum < maxCoreNum ? totalTaskNum : maxCoreNum);
+      totalTaskNum < maxCoreNum ? totalTaskNumU32 : maxCoreNum;
+
+  // P11A: reproduce the kernel's P9A weighted contiguous partition on Host.
+  // Each AI Core receives only its final [taskStart, taskEnd) range, avoiding
+  // repeated seq/kv scans and boundary searches at kernel startup.
+  const uint64_t weightPerCore = totalTaskWeight / usedCoreNum;
+  const uint64_t weightRemainder = totalTaskWeight % usedCoreNum;
+  for (uint32_t coreIdx = 0; coreIdx < usedCoreNum; ++coreIdx) {
+    const uint32_t nextCoreIdx = coreIdx + 1;
+    const uint64_t targetWeightStart =
+        weightPerCore * coreIdx + weightRemainder * coreIdx / usedCoreNum;
+    const uint64_t targetWeightEnd =
+        weightPerCore * nextCoreIdx + weightRemainder * nextCoreIdx / usedCoreNum;
+    taskStartPerCore[coreIdx] = FindWeightedTaskBoundary(
+        targetWeightStart, seqLens, kvLens, batchSize, qHeadNum, pageSize,
+        kvTileSize, tilesPerPage, totalTaskNumU32);
+    taskEndPerCore[coreIdx] = FindWeightedTaskBoundary(
+        targetWeightEnd, seqLens, kvLens, batchSize, qHeadNum, pageSize,
+        kvTileSize, tilesPerPage, totalTaskNumU32);
+  }
 
   //* 将待传数据放在tiling中
   tiling.set_batchSize(batchSize);
@@ -244,6 +375,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   tiling.set_maskRowSize(maskRowSize);
   tiling.set_gqaGroupSize(gqaGroupSize);
   tiling.set_usedCoreNum(usedCoreNum);
+  tiling.set_taskStartPerCore(taskStartPerCore);
+  tiling.set_taskEndPerCore(taskEndPerCore);
 
   context->SetBlockDim(usedCoreNum);
   tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());

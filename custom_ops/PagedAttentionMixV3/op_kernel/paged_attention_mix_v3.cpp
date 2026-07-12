@@ -116,47 +116,11 @@ public:
         const uint32_t keyGroupStride = pageSize * qkHeadSize;
         const uint32_t valueGroupStride = pageSize * vHeadSize;
 
-        uint32_t totalTaskNum = 0;
-        uint64_t totalTaskWeight = 0;
-        for (uint32_t batchIdx = 0; batchIdx < tilingData->batchSize; ++batchIdx) {
-            const uint32_t seqLen = static_cast<uint32_t>(seqLenGm.GetValue(batchIdx));
-            const uint32_t kvLen = static_cast<uint32_t>(kvLengthsGm.GetValue(batchIdx));
-            const uint32_t qSliceNum = CeilDiv(seqLen, qBlockRows);
-            totalTaskNum += qSliceNum * qHeadNum;
-            totalTaskWeight += GetPerHeadTaskWeight(seqLen,
-                                                    kvLen,
-                                                    pageSize,
-                                                    kvTileSize,
-                                                    tilesPerPage) * qHeadNum;
-        }
-        if (totalTaskNum == 0 || totalTaskWeight == 0) {
-            return;
-        }
-
-        // P9A: keep each core's task range contiguous, but split by estimated
-        // work instead of task count. A task pays one fixed-cost unit plus one
-        // unit for every visible KV tile. This preserves the existing
-        // batch->qHead->qSlice order and KV-reuse locality while avoiding the
-        // large imbalance between short-context and long-context tasks.
-        const uint64_t weightPerCore = totalTaskWeight / usedCoreNum;
-        const uint64_t weightRemainder = totalTaskWeight % usedCoreNum;
-        const uint64_t targetWeightStart =
-            weightPerCore * coreIdx + weightRemainder * coreIdx / usedCoreNum;
-        const uint32_t nextCoreIdx = coreIdx + 1;
-        const uint64_t targetWeightEnd =
-            weightPerCore * nextCoreIdx + weightRemainder * nextCoreIdx / usedCoreNum;
-        uint32_t taskIdStart = FindWeightedTaskBoundary(targetWeightStart,
-                                                        qHeadNum,
-                                                        pageSize,
-                                                        kvTileSize,
-                                                        tilesPerPage,
-                                                        totalTaskNum);
-        uint32_t taskIdEnd = FindWeightedTaskBoundary(targetWeightEnd,
-                                                      qHeadNum,
-                                                      pageSize,
-                                                      kvTileSize,
-                                                      tilesPerPage,
-                                                      totalTaskNum);
+        // P11A: Host tiling reproduces the P9A weighted contiguous partition.
+        // Keep only the final per-core task range on device; task execution and
+        // ordering remain unchanged.
+        const uint32_t taskIdStart = tilingData->taskStartPerCore[coreIdx];
+        const uint32_t taskIdEnd = tilingData->taskEndPerCore[coreIdx];
         if (taskIdStart >= taskIdEnd) {
             return;
         }
@@ -564,105 +528,6 @@ private:
     __aicore__ inline uint32_t CeilDiv(uint32_t lhs, uint32_t rhs) const
     {
         return (lhs + rhs - 1) / rhs;
-    }
-
-    __aicore__ inline uint64_t GetSliceTaskWeight(uint32_t seqLen,
-                                                    uint32_t kvLen,
-                                                    uint32_t qSliceIdx,
-                                                    uint32_t pageSize,
-                                                    uint32_t kvTileSize,
-                                                    uint32_t tilesPerPage) const
-    {
-        const uint32_t qBlockStart = qSliceIdx * qBlockRows;
-        const uint32_t realQBlockRows = Min(qBlockRows, seqLen - qBlockStart);
-        const uint32_t visibleKvEnd = kvLen - seqLen + qBlockStart + realQBlockRows;
-        const uint32_t fullPageNum = visibleKvEnd / pageSize;
-        const uint32_t tailInPage = visibleKvEnd - fullPageNum * pageSize;
-        const uint32_t visibleKvTileCount =
-            fullPageNum * tilesPerPage +
-            (tailInPage == 0 ? 0U : CeilDiv(tailInPage, kvTileSize));
-        // One unit represents fixed per-task work (Q load, normalize and ND
-        // write); the remaining units track BMM/softmax/update work per tile.
-        return static_cast<uint64_t>(visibleKvTileCount) + 1U;
-    }
-
-    __aicore__ inline uint64_t GetPerHeadTaskWeight(uint32_t seqLen,
-                                                      uint32_t kvLen,
-                                                      uint32_t pageSize,
-                                                      uint32_t kvTileSize,
-                                                      uint32_t tilesPerPage) const
-    {
-        const uint32_t qSliceNum = CeilDiv(seqLen, qBlockRows);
-        uint64_t perHeadWeight = 0;
-        for (uint32_t qSliceIdx = 0; qSliceIdx < qSliceNum; ++qSliceIdx) {
-            perHeadWeight += GetSliceTaskWeight(seqLen,
-                                                kvLen,
-                                                qSliceIdx,
-                                                pageSize,
-                                                kvTileSize,
-                                                tilesPerPage);
-        }
-        return perHeadWeight;
-    }
-
-    __aicore__ inline uint32_t FindWeightedTaskBoundary(uint64_t targetWeight,
-                                                           uint32_t qHeadNum,
-                                                           uint32_t pageSize,
-                                                           uint32_t kvTileSize,
-                                                           uint32_t tilesPerPage,
-                                                           uint32_t totalTaskNum)
-    {
-        if (targetWeight == 0) {
-            return 0;
-        }
-
-        uint64_t weightBeforeBatch = 0;
-        uint32_t taskBase = 0;
-        for (uint32_t batchIdx = 0; batchIdx < tilingData->batchSize; ++batchIdx) {
-            const uint32_t seqLen = static_cast<uint32_t>(seqLenGm.GetValue(batchIdx));
-            const uint32_t kvLen = static_cast<uint32_t>(kvLengthsGm.GetValue(batchIdx));
-            const uint32_t qSliceNum = CeilDiv(seqLen, qBlockRows);
-            const uint64_t perHeadWeight = GetPerHeadTaskWeight(seqLen,
-                                                               kvLen,
-                                                               pageSize,
-                                                               kvTileSize,
-                                                               tilesPerPage);
-            const uint64_t batchWeight = perHeadWeight * qHeadNum;
-            const uint32_t batchTaskNum = qSliceNum * qHeadNum;
-            if (targetWeight > weightBeforeBatch + batchWeight) {
-                weightBeforeBatch += batchWeight;
-                taskBase += batchTaskNum;
-                continue;
-            }
-
-            const uint64_t targetInBatch = targetWeight - weightBeforeBatch;
-            const uint32_t qHeadIdx = static_cast<uint32_t>(targetInBatch / perHeadWeight);
-            if (qHeadIdx >= qHeadNum) {
-                return taskBase + batchTaskNum;
-            }
-
-            const uint64_t targetInHead = targetInBatch - perHeadWeight * qHeadIdx;
-            uint64_t weightBeforeSlice = 0;
-            const uint32_t headTaskBase = taskBase + qHeadIdx * qSliceNum;
-            for (uint32_t qSliceIdx = 0; qSliceIdx < qSliceNum; ++qSliceIdx) {
-                const uint64_t sliceWeight = GetSliceTaskWeight(seqLen,
-                                                               kvLen,
-                                                               qSliceIdx,
-                                                               pageSize,
-                                                               kvTileSize,
-                                                               tilesPerPage);
-                const uint64_t weightAfterSlice = weightBeforeSlice + sliceWeight;
-                if (targetInHead <= weightAfterSlice) {
-                    const uint64_t distanceToPrevious = targetInHead - weightBeforeSlice;
-                    const uint64_t distanceToNext = weightAfterSlice - targetInHead;
-                    return headTaskBase + qSliceIdx +
-                           (distanceToNext < distanceToPrevious ? 1U : 0U);
-                }
-                weightBeforeSlice = weightAfterSlice;
-            }
-            return headTaskBase + qSliceNum;
-        }
-        return totalTaskNum;
     }
 
     __aicore__ inline uint32_t Min(uint32_t lhs, uint32_t rhs) const
