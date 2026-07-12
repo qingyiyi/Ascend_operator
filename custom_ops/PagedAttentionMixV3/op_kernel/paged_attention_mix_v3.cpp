@@ -192,6 +192,7 @@ public:
         uint32_t valueGroupBase = groupIdx * valueGroupStride;
         uint32_t qHeadOutputOffset = qHeadIdx * vHeadSize;
         uint32_t blockTableBatchOffset = batchIdx * pageNumPerBatch;
+        bool blockTableCacheActive = PrefetchBlockTable(blockTableBatchOffset, kvPageNum);
 
         /****************** PrimeSingleBufferFlags(); ******************/ 
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(Pingflag);
@@ -268,8 +269,7 @@ public:
                                                    kvTileSize,
                                                    pageSize,
                                                    visibleKvEnd,
-                                                   maskRowOffset,
-                                                   blockTableBatchOffset)) {
+                                                   maskRowOffset)) {
                         break;
                     }
                     AdvanceKvTileCursor(cursorPageIdx,
@@ -285,8 +285,7 @@ public:
                                                                        kvTileSize,
                                                                        pageSize,
                                                                        visibleKvEnd,
-                                                                       maskRowOffset,
-                                                                       blockTableBatchOffset);
+                                                                       maskRowOffset);
                     if (hasPongTile) {
                         AdvanceKvTileCursor(cursorPageIdx,
                                             cursorTileStartInPage,
@@ -319,8 +318,10 @@ public:
                     uint32_t pingKeyOffset = 0;
                     uint32_t pingValueOffset = 0;
                     if (loadPingKvFromGm) {
-                        const uint32_t physicalPageIdx = static_cast<uint32_t>(
-                            blockTableGm.GetValue(pingTile.blockTableOffset));
+                        const uint32_t physicalPageIdx = GetPhysicalPageIdx(
+                            pingTile.pageIdxInSeq,
+                            blockTableBatchOffset,
+                            blockTableCacheActive);
                         const uint32_t tileOffset = pingTile.tileStartInPage * CUBE_BLOCK_SIZE;
                         pingKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase + tileOffset;
                         pingValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase + tileOffset;
@@ -349,8 +350,10 @@ public:
                         uint32_t pongKeyOffset = 0;
                         uint32_t pongValueOffset = 0;
                         if (loadPongKvFromGm) {
-                            const uint32_t physicalPageIdx = static_cast<uint32_t>(
-                                blockTableGm.GetValue(pongTile.blockTableOffset));
+                            const uint32_t physicalPageIdx = GetPhysicalPageIdx(
+                                pongTile.pageIdxInSeq,
+                                blockTableBatchOffset,
+                                blockTableCacheActive);
                             const uint32_t tileOffset = pongTile.tileStartInPage * CUBE_BLOCK_SIZE;
                             pongKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase + tileOffset;
                             pongValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase + tileOffset;
@@ -512,6 +515,7 @@ public:
             kvLen = static_cast<uint32_t>(kvLengthsGm.GetValue(batchIdx));
             historyKvLen = kvLen - seqLen;
             kvPageNum = CeilDiv(kvLen, pageSize);
+            blockTableCacheActive = PrefetchBlockTable(blockTableBatchOffset, kvPageNum);
             qSliceNum = CeilDiv(seqLen, qBlockRows);
         }
 
@@ -554,7 +558,7 @@ private:
         uint32_t tileSize;
         uint32_t tilePageStart;
         uint32_t maskOffset;
-        uint32_t blockTableOffset;
+        uint32_t pageIdxInSeq;
     };
 
     __aicore__ inline uint32_t CeilDiv(uint32_t lhs, uint32_t rhs) const
@@ -694,8 +698,7 @@ private:
                                                      uint32_t kvTileSize,
                                                      uint32_t pageSize,
                                                      uint32_t visibleKvEnd,
-                                                     uint32_t maskRowOffset,
-                                                     uint32_t blockTableBatchOffset)
+                                                     uint32_t maskRowOffset)
     {
         const uint32_t tilePageStart = pageIdxInSeq * pageSize + tileStartInPage;
         if (tilePageStart >= visibleKvEnd) {
@@ -707,8 +710,55 @@ private:
         tileInfo.tilePageStart = tilePageStart;
         tileInfo.maskOffset =
             ((tilePageStart >> 4) * tilingData->maskRowSize << 4) + maskRowOffset;
-        tileInfo.blockTableOffset = blockTableBatchOffset + pageIdxInSeq;
+        tileInfo.pageIdxInSeq = pageIdxInSeq;
         return true;
+    }
+
+    __aicore__ inline bool PrefetchBlockTable(uint32_t blockTableBatchOffset,
+                                               uint32_t kvPageNum)
+    {
+        if (kvPageNum == 0 || kvPageNum > blockTableCacheCapacity) {
+            return false;
+        }
+
+        constexpr uint32_t entriesPerDataBlock = DATA_BLOCK_BYTES / sizeof(int32_t);
+        const uint32_t alignedEntryCount = kvPageNum / entriesPerDataBlock * entriesPerDataBlock;
+        if (alignedEntryCount != 0) {
+            // The previous batch may still have issued scalar reads from this UB
+            // cache. Drain S before MTE2 overwrites it, then wait until the bulk
+            // GM->UB copy is visible to scalar GetValue calls in the task loop.
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(Pingflag);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(Pingflag);
+            AscendC::DataCopy(blockTableUb,
+                              blockTableGm[blockTableBatchOffset],
+                              AscendC::DataCopyParams(
+                                  1,
+                                  static_cast<uint16_t>(alignedEntryCount / entriesPerDataBlock),
+                                  0,
+                                  0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(Pingflag);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(Pingflag);
+        }
+
+        // Handle a sub-32-byte tail without reading beyond the last batch's
+        // block-table allocation. This runs once per batch, not once per KV tile.
+        for (uint32_t pageIdx = alignedEntryCount; pageIdx < kvPageNum; ++pageIdx) {
+            blockTableUb.SetValue(
+                pageIdx,
+                blockTableGm.GetValue(blockTableBatchOffset + pageIdx));
+        }
+        return true;
+    }
+
+    __aicore__ inline uint32_t GetPhysicalPageIdx(uint32_t pageIdxInSeq,
+                                                  uint32_t blockTableBatchOffset,
+                                                  bool blockTableCacheActive)
+    {
+        if (blockTableCacheActive) {
+            return static_cast<uint32_t>(blockTableUb.GetValue(pageIdxInSeq));
+        }
+        return static_cast<uint32_t>(
+            blockTableGm.GetValue(blockTableBatchOffset + pageIdxInSeq));
     }
 
     __aicore__ inline void InitLocalBuffer()
@@ -766,6 +816,11 @@ private:
         const uint32_t outBytes = outSize * sizeof(float);
         const uint32_t outF16Bytes = outF16Size * sizeof(half);
         const uint32_t rowStateBytes = rowSize * (4 * sizeof(half) + 5 * sizeof(float));
+        const uint32_t blockTableUbOffset =
+            UB_ROW_STATE_OFFSET + RoundUp(rowStateBytes, DATA_BLOCK_BYTES);
+        blockTableCacheCapacity = blockTableUbOffset <= UB_WORK_OFFSET
+                                      ? (UB_WORK_OFFSET - blockTableUbOffset) / sizeof(int32_t)
+                                      : 0;
         const uint32_t maskBytes = maskSize * sizeof(DTYPE_ATTENTIONMASK);
         const uint32_t workBytes = workSize * sizeof(float);
 
@@ -839,6 +894,10 @@ private:
         lPageUbPong = ubBase[rowOffset].ReinterpretCast<float>();
         rowOffset += rowSize * sizeof(float);
         lNewUb = ubBase[rowOffset].ReinterpretCast<float>();
+        // R4 has substantial slack after the row state. Stage the current
+        // batch's tiny logical->physical page map here so every q-head/q-slice
+        // task can resolve K/V pages from UB instead of issuing scalar GM loads.
+        blockTableUb = ubBase[blockTableUbOffset].ReinterpretCast<int32_t>();
 
         // R5 low 8 KiB: vector workspace; the following packed 64 KiB:
         // cross-KV-tile fp32 output numerator. Keeping it below 232 KiB avoids
@@ -2379,6 +2438,7 @@ private:
     AscendC::LocalTensor<DTYPE_VCACHE> valueL1Pong;
     AscendC::LocalTensor<DTYPE_KCACHE> kvReuseKeyL1;
     AscendC::LocalTensor<DTYPE_VCACHE> kvReuseValueL1;
+    AscendC::LocalTensor<int32_t> blockTableUb;
 
     AscendC::GlobalTensor<DTYPE_QUERY> queryGm;
     AscendC::GlobalTensor<DTYPE_QUERY> queryNzGm;
@@ -2394,6 +2454,7 @@ private:
     uint32_t kvReuseCacheTileCount = 0;
     uint32_t kvReuseKeyTileElements = 0;
     uint32_t kvReuseValueTileElements = 0;
+    uint32_t blockTableCacheCapacity = 0;
 };
 
 
