@@ -61,9 +61,10 @@ constexpr auto PongflagPlus6 = EVENT_ID7;
 // R2+R3 has one physical owner even though mask/prob/PV use different logical tensors.
 // EVENT_ID7 is free for the V_MTE1/V_MTE2 event types used by this shared-arena guard.
 constexpr auto SharedUbFlag = EVENT_ID7;
-// outF16Ub aliases scoreF16UbPong. Protect the interval from the final output
-// MTE3 read until the next Vector reuse of the pong score slot without draining
-// every pipeline at the end of each task. EVENT_ID6 is free for MTE3_V.
+// The final MTE3 reads an ND-packed half view that reuses outUb storage.
+// Protect that source until the next task first overwrites outUb, while still
+// allowing its Q/K/BMM1/softmax work to overlap the previous output write.
+// EVENT_ID6 is free for MTE3_V.
 constexpr auto OutputReuseFlag = EVENT_ID6;
 }
 
@@ -185,8 +186,8 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(PongflagPlus6);
         // The first shared-arena owner is always Softmax Ping's mask load (MTE1).
         AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
-        // Initially the pong score/output slot is free. Each output write returns
-        // this token only after MTE3 has finished reading outF16Ub.
+        // Initially outUb is free. Each final output write returns this token
+        // only after MTE3 has finished reading its ND-packed half view.
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
         bool outputReusePending = true;
         // Keep the cache immutable after choosing its owner. This avoids any
@@ -361,12 +362,6 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
                         /****** ATB: Softmax Pong Starts ******/
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
-                        if (outputReusePending) {
-                            // scoreF16UbPong aliases the previous task's output source.
-                            // Delay only this first Vector reuse until MTE3 has read it.
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
-                            outputReusePending = false;
-                        }
                         SoftmaxPongSingle(qHistoryStart,
                                           pongTile.tilePageStart,
                                           realQBlockRows,
@@ -398,6 +393,13 @@ public:
 
                     /****** ATB: Update Ping Starts ******/
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
+                    if (isFirstKvTile && outputReusePending) {
+                        // This is the first Vector write to outUb in the new task.
+                        // Delay it until the previous task's wide MTE3 has consumed
+                        // the ND-packed half view stored in the same physical arena.
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
+                        outputReusePending = false;
+                    }
                     UpdatePingSingle(mActual,
                                      roundM,
                                      vHeadSize,
@@ -424,12 +426,6 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(Pongflag);
                 }
 
-                if (outputReusePending) {
-                    // A one-tile task never touched the pong score slot. Consume
-                    // the previous output token before casting into the alias.
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
-                    outputReusePending = false;
-                }
                 NormalizeAndWriteOutput(outputOffset,         //* 此时得到了总l，因此处理l得到最终的输出
                                         mActual,
                                         roundM,
@@ -1708,52 +1704,59 @@ private:
         AscendC::SetVectorMask<int8_t>(highMask, lowMask);
     }
 
-    __aicore__ inline void DivC0BlocksHalf(AscendC::LocalTensor<half> dst,
-                                           AscendC::LocalTensor<half> divisor,
-                                           uint32_t rowCount,
-                                           uint32_t rowStride,
-                                           uint32_t colCount)
+    __aicore__ inline void DivC0BlocksToNdHalf(AscendC::LocalTensor<half> dstNd,
+                                               AscendC::LocalTensor<half> numeratorNz,
+                                               AscendC::LocalTensor<half> divisorC0,
+                                               uint32_t rowCount,
+                                               uint32_t srcRowStride,
+                                               uint32_t colCount)
     {
-        // One fp16 vector repeat covers eight [row][C0] rows. Issue the full
-        // repeats explicitly for each V block so the compiler does not expand
-        // eight generic count-mode Div calls. A non-eight-row tail is shared
-        // by all V blocks in one masked multi-repeat, matching ATB's tail path.
+        // Fuse the mandatory final normalization with the C0/NZ -> ND layout
+        // conversion. One full vector repeat consumes eight contiguous C0 rows
+        // from the current V block and scatters them to the same V block in
+        // eight consecutive ND rows. This preserves the efficient full-mask
+        // Div pass and avoids P12A's extra masked Adds packing pass.
         constexpr uint32_t ROWS_PER_REPEAT = HALFS_PER_VECTOR_REPEAT / CUBE_BLOCK_SIZE;
+        const uint32_t colBlockCount = colCount / CUBE_BLOCK_SIZE;
         const uint32_t fullRows = rowCount / ROWS_PER_REPEAT * ROWS_PER_REPEAT;
         const uint8_t fullRepeat = static_cast<uint8_t>(fullRows / ROWS_PER_REPEAT);
-        const uint32_t colBlockCount = colCount / CUBE_BLOCK_SIZE;
+        const uint8_t dstBlockStride = static_cast<uint8_t>(colBlockCount);
+        const AscendC::BinaryRepeatParams transDivParams(
+            dstBlockStride,
+            1,
+            1,
+            static_cast<uint8_t>(colBlockCount * ROWS_PER_REPEAT),
+            ROWS_PER_REPEAT,
+            ROWS_PER_REPEAT);
 
         if (fullRepeat != 0) {
-            const AscendC::BinaryRepeatParams fullParams(1, 1, 1, 8, 8, 8);
             for (uint32_t colBlock = 0; colBlock < colBlockCount; ++colBlock) {
-                const uint32_t blockOffset = colBlock * rowStride * CUBE_BLOCK_SIZE;
-                AscendC::Div<half, false>(dst[blockOffset],
-                                          dst[blockOffset],
-                                          divisor,
+                const uint32_t colStart = colBlock * CUBE_BLOCK_SIZE;
+                const uint32_t srcOffset = colStart * srcRowStride;
+                AscendC::Div<half, false>(dstNd[colStart],
+                                          numeratorNz[srcOffset],
+                                          divisorC0,
                                           (uint64_t)0,
                                           fullRepeat,
-                                          fullParams);
+                                          transDivParams);
             }
         }
 
         const uint32_t tailRows = rowCount - fullRows;
         if (tailRows != 0) {
-            const uint32_t tailElements = tailRows * CUBE_BLOCK_SIZE;
-            SetHalfVectorMaskByCount(tailElements);
-            const uint32_t tailOffset = fullRows * CUBE_BLOCK_SIZE;
-            const AscendC::BinaryRepeatParams tailParams(
-                1,
-                1,
-                1,
-                static_cast<uint8_t>(rowStride),
-                static_cast<uint8_t>(rowStride),
-                0);
-            AscendC::Div<half, false>(dst[tailOffset],
-                                      dst[tailOffset],
-                                      divisor[tailOffset],
-                                      (uint64_t)0,
-                                      static_cast<uint8_t>(colBlockCount),
-                                      tailParams);
+            SetHalfVectorMaskByCount(tailRows * CUBE_BLOCK_SIZE);
+            const uint32_t dstRowOffset = fullRows * colCount;
+            const uint32_t srcRowOffset = fullRows * CUBE_BLOCK_SIZE;
+            for (uint32_t colBlock = 0; colBlock < colBlockCount; ++colBlock) {
+                const uint32_t colStart = colBlock * CUBE_BLOCK_SIZE;
+                const uint32_t srcOffset = colStart * srcRowStride + srcRowOffset;
+                AscendC::Div<half, false>(dstNd[dstRowOffset + colStart],
+                                          numeratorNz[srcOffset],
+                                          divisorC0[srcRowOffset],
+                                          (uint64_t)0,
+                                          1,
+                                          transDivParams);
+            }
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         }
         AscendC::PipeBarrier<PIPE_V>();
@@ -2296,9 +2299,9 @@ private:
                                                    uint32_t vHeadSize)
     {
         // Keep ATB's fp16 final normalization while preserving the internal
-        // [vBlock][row][C0] layout. Each block is contiguous, so cast/div are
-        // dense vector operations. Only the final MTE3 copies scatter C0 blocks
-        // into the public ND [token, qHead, vDim] tensor.
+        // [vBlock][row][C0] layout through the numerator cast. The final Div
+        // uses strided ND destinations, so normalization itself produces the
+        // public [token, qHead, vDim] row layout without an extra UB pass.
         CastFloatToHalfChunked(mNewF16Ub, lOrgUb, roundM);
         AscendC::PipeBarrier<PIPE_V>();
         ExpandToC0BlockHalf(workF16Ub, mNewF16Ub, roundM);
@@ -2310,28 +2313,32 @@ private:
         CastFloatToHalfChunked(outF16Ub, outUb, roundM * vHeadSize);
         AscendC::PipeBarrier<PIPE_V>();
 
-        DivC0BlocksHalf(outF16Ub,
-                        workF16Ub,
-                        mActual,
-                        roundM,
-                        vHeadSize);
+        // Reuse the dead fp32 numerator arena as an fp16 ND staging buffer.
+        // P12B fuses normalization and NZ->ND conversion: Div reads the dense
+        // [vBlock][row][C0] numerator but writes directly to [row][vHeadSize].
+        AscendC::LocalTensor<half> outputNdF16Ub = outUb.ReinterpretCast<half>();
+        DivC0BlocksToNdHalf(outputNdF16Ub,
+                           outF16Ub,
+                           workF16Ub,
+                           mActual,
+                           roundM,
+                           vHeadSize);
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
+        const uint16_t outputRowBlocks = static_cast<uint16_t>(
+            vHeadSize * sizeof(DTYPE_OUTPUT) / DATA_BLOCK_BYTES);
         const uint16_t dstStride = static_cast<uint16_t>(
-            (qHeadNum * vHeadSize - CUBE_BLOCK_SIZE) *
-            sizeof(DTYPE_OUTPUT) / DATA_BLOCK_BYTES);
-        for (uint32_t colStart = 0; colStart < vHeadSize; colStart += CUBE_BLOCK_SIZE) {
-            AscendC::DataCopy(outputGm[outputOffset + colStart],
-                              outF16Ub[colStart * roundM],
-                              AscendC::DataCopyParams(
-                                  static_cast<uint16_t>(mActual),
-                                  1,
-                                  0,
-                                  dstStride));
-        }
-        // Return ownership of outF16Ub/scoreF16UbPong only after all C0 writes
-        // have consumed the source. The next task waits at its first reuse.
+            (qHeadNum - 1) * outputRowBlocks);
+        AscendC::DataCopy(outputGm[outputOffset],
+                          outputNdF16Ub,
+                          AscendC::DataCopyParams(
+                              static_cast<uint16_t>(mActual),
+                              outputRowBlocks,
+                              0,
+                              dstStride));
+        // Return ownership of the ND staging view only after MTE3 has consumed
+        // it. The next task waits immediately before its first outUb write.
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
     }
 
