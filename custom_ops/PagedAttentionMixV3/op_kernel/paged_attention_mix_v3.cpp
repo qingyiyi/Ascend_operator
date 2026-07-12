@@ -110,8 +110,9 @@ public:
         const uint32_t pageSize = tilingData->pageSize;
         const uint32_t pageNumPerBatch = tilingData->pageNumPerBatch;
         const uint32_t gqaGroupSize = tilingData->gqaGroupSize;
-        const uint32_t kvTileSize = Min(pageSize, KV_TILE_SIZE);
-        const uint32_t tilesPerPage = CeilDiv(pageSize, kvTileSize);
+        // Host tiling accepts page sizes up to KV_TILE_SIZE, so one compute tile
+        // always maps directly to one physical cache page in this kernel. Use the
+        // ATB-style tileIdx -> blockTable[tileIdx] path without a page cursor.
         const uint32_t keyPhysicalPageStride = pageSize * tilingData->kvHeadNum * qkHeadSize;
         const uint32_t valuePhysicalPageStride = pageSize * tilingData->kvHeadNum * vHeadSize;
         const uint32_t keyGroupStride = pageSize * qkHeadSize;
@@ -210,11 +211,9 @@ public:
 
                 const uint32_t qHistoryStart = historyKvLen + qBlockStart;
                 const uint32_t visibleKvEnd = qHistoryStart + realQBlockRows;
-                const uint32_t totalKvTiles = kvPageNum * tilesPerPage;
+                const uint32_t totalKvTiles = CeilDiv(visibleKvEnd, pageSize);
                 const uint32_t maskRowOffset = qTokenStart * CUBE_BLOCK_SIZE;
                 const uint32_t outputOffset = qTokenStart * outputTokenStride + qHeadOutputOffset;
-                uint32_t cursorPageIdx = 0;
-                uint32_t cursorTileStartInPage = 0;
                 bool queryGuardConsumed = false;
 
                 if (!kvReuseOwnerValid && kvReuseCacheTileCount != 0) {
@@ -228,34 +227,18 @@ public:
 
                 for (uint32_t tilePairStart = 0; tilePairStart < totalKvTiles; tilePairStart += 2) {
                     KvTileInfo pingTile;
-                    if (!BuildKvTileInfoAtPosition(pingTile,
-                                                   cursorPageIdx,
-                                                   cursorTileStartInPage,
-                                                   kvTileSize,
-                                                   pageSize,
-                                                   visibleKvEnd,
-                                                   maskRowOffset)) {
-                        break;
-                    }
-                    AdvanceKvTileCursor(cursorPageIdx,
-                                        cursorTileStartInPage,
-                                        kvTileSize,
-                                        pageSize);
+                    BuildDirectPageTileInfo(pingTile,
+                                            tilePairStart,
+                                            pageSize,
+                                            maskRowOffset);
 
                     KvTileInfo pongTile;
-                    const bool hasPongTile = tilePairStart + 1 < totalKvTiles &&
-                                             BuildKvTileInfoAtPosition(pongTile,
-                                                                       cursorPageIdx,
-                                                                       cursorTileStartInPage,
-                                                                       kvTileSize,
-                                                                       pageSize,
-                                                                       visibleKvEnd,
-                                                                       maskRowOffset);
+                    const bool hasPongTile = tilePairStart + 1 < totalKvTiles;
                     if (hasPongTile) {
-                        AdvanceKvTileCursor(cursorPageIdx,
-                                            cursorTileStartInPage,
-                                            kvTileSize,
-                                            pageSize);
+                        BuildDirectPageTileInfo(pongTile,
+                                                tilePairStart + 1,
+                                                pageSize,
+                                                maskRowOffset);
                     }
 
                     const bool usePingKvReuse = isKvReuseOwner &&
@@ -276,9 +259,6 @@ public:
                         kvReuseValidMask |= pongKvReuseBit;
                     }
 
-                    /****** ATB: Bmm1 Ping Start ******/
-                    const bool isFirstKvTile = tilePairStart == 0;
-                    queryGuardConsumed = queryGuardConsumed || isFirstKvTile;
                     const bool loadPingKvFromGm = !usePingKvReuse || fillPingKvReuse;
                     uint32_t pingKeyOffset = 0;
                     uint32_t pingValueOffset = 0;
@@ -287,134 +267,70 @@ public:
                             pingTile.pageIdxInSeq,
                             blockTableBatchOffset,
                             blockTableCacheActive);
-                        const uint32_t tileOffset = pingTile.tileStartInPage * CUBE_BLOCK_SIZE;
-                        pingKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase + tileOffset;
-                        pingValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase + tileOffset;
+                        pingKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase;
+                        pingValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase;
                     }
-                    Bmm1PingSingle(isFirstKvTile,
-                                   isFirstKvTile,
-                                   hasPongTile,
-                                   qTokenStart,
-                                   qHeadStart,
-                                   realQBlockRows,
-                                   mActual,
-                                   roundM,
-                                   qkHeadSize,
-                                   curGqaTileSize,
-                                   pingTile.maskOffset,
-                                   pingKeyOffset,
-                                   pingValueOffset,
-                                   pageSize,
-                                   pingTile.tileSize,
-                                   vHeadSize,
-                                   usePingKvReuse,
-                                   loadPingKvFromGm,
-                                   tilePairStart);
-                    if (hasPongTile) {
-                        const bool loadPongKvFromGm = !usePongKvReuse || fillPongKvReuse;
-                        uint32_t pongKeyOffset = 0;
-                        uint32_t pongValueOffset = 0;
-                        if (loadPongKvFromGm) {
-                            const uint32_t physicalPageIdx = GetPhysicalPageIdx(
-                                pongTile.pageIdxInSeq,
-                                blockTableBatchOffset,
-                                blockTableCacheActive);
-                            const uint32_t tileOffset = pongTile.tileStartInPage * CUBE_BLOCK_SIZE;
-                            pongKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase + tileOffset;
-                            pongValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase + tileOffset;
-                        }
-                        /****** ATB: Bmm1 Pong Starts ******/
-                        Bmm1PongSingle(false,
-                                       isFirstKvTile,
-                                       false,
-                                       qTokenStart,
-                                       qHeadStart,
-                                       realQBlockRows,
-                                       mActual,
-                                       roundM,
-                                       qkHeadSize,
-                                       curGqaTileSize,
-                                       pongTile.maskOffset,
-                                       pongKeyOffset,
-                                       pongValueOffset,
-                                       pageSize,
-                                       pongTile.tileSize,
-                                       vHeadSize,
-                                       usePongKvReuse,
-                                       loadPongKvFromGm,
-                                       pongTileIdx);
+                    // P13A: select the first-pair or steady-state specialization once here.
+                    // The inlined specialization removes the repeated first-tile branches from
+                    // BMM1 Q handling, online softmax, output-state update, and PV folding.
+                    if (tilePairStart == 0) {
+                        queryGuardConsumed = true;
+                        ProcessKvTilePair<true>(qHistoryStart,
+                                                qTokenStart,
+                                                qHeadStart,
+                                                realQBlockRows,
+                                                mActual,
+                                                roundM,
+                                                qkHeadSize,
+                                                curGqaTileSize,
+                                                pageSize,
+                                                vHeadSize,
+                                                tilePairStart,
+                                                pingTile,
+                                                hasPongTile,
+                                                pongTile,
+                                                pingKeyOffset,
+                                                pingValueOffset,
+                                                usePingKvReuse,
+                                                usePongKvReuse,
+                                                fillPongKvReuse,
+                                                loadPingKvFromGm,
+                                                blockTableBatchOffset,
+                                                blockTableCacheActive,
+                                                keyPhysicalPageStride,
+                                                valuePhysicalPageStride,
+                                                keyGroupBase,
+                                                valueGroupBase,
+                                                outputReusePending);
+                    } else {
+                        ProcessKvTilePair<false>(qHistoryStart,
+                                                 qTokenStart,
+                                                 qHeadStart,
+                                                 realQBlockRows,
+                                                 mActual,
+                                                 roundM,
+                                                 qkHeadSize,
+                                                 curGqaTileSize,
+                                                 pageSize,
+                                                 vHeadSize,
+                                                 tilePairStart,
+                                                 pingTile,
+                                                 hasPongTile,
+                                                 pongTile,
+                                                 pingKeyOffset,
+                                                 pingValueOffset,
+                                                 usePingKvReuse,
+                                                 usePongKvReuse,
+                                                 fillPongKvReuse,
+                                                 loadPingKvFromGm,
+                                                 blockTableBatchOffset,
+                                                 blockTableCacheActive,
+                                                 keyPhysicalPageStride,
+                                                 valuePhysicalPageStride,
+                                                 keyGroupBase,
+                                                 valueGroupBase,
+                                                 outputReusePending);
                     }
-
-                    /****** ATB: Softmax Ping Starts ******/
-                    // R2+R3 owner sequence for one pair is:
-                    // Softmax Ping -> Softmax Pong (optional) -> Update Ping -> Update Pong (optional).
-                    // Mask is written by MTE1, while PV is written by MTE2; both are consumed by V.
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
-                    SoftmaxPingSingle(qHistoryStart,
-                                      pingTile.tilePageStart,
-                                      realQBlockRows,
-                                      mActual,
-                                      roundM,
-                                      curGqaTileSize,
-                                      pingTile.tileSize,
-                                      isFirstKvTile);
-                    if (hasPongTile) {
-                        AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
-                        /****** ATB: Softmax Pong Starts ******/
-                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
-                        SoftmaxPongSingle(qHistoryStart,
-                                          pongTile.tilePageStart,
-                                          realQBlockRows,
-                                          mActual,
-                                          roundM,
-                                          curGqaTileSize,
-                                          pongTile.tileSize,
-                                          false);
-                    }
-                    // The next owner is always Update Ping, whose L0C->UB copy uses MTE2.
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
-
-                    /****** ATB: Bmm2 Ping Starts ******/
-                    Bmm2PingSingle(mActual,
-                                   roundM,
-                                   pingTile.tileSize,
-                                   vHeadSize,
-                                   usePingKvReuse,
-                                   tilePairStart);     //* P*V
-                    if (hasPongTile) {
-                        /****** ATB: Bmm2 Pong Starts ******/
-                        Bmm2PongSingle(mActual,
-                                       roundM,
-                                       pongTile.tileSize,
-                                       vHeadSize,
-                                       usePongKvReuse,
-                                       pongTileIdx);     //* P*V
-                    }
-
-                    /****** ATB: Update Ping Starts ******/
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
-                    if (isFirstKvTile && outputReusePending) {
-                        // This is the first Vector write to outUb in the new task.
-                        // Delay it until the previous task's wide MTE3 has consumed
-                        // the ND-packed half view stored in the same physical arena.
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
-                        outputReusePending = false;
-                    }
-                    UpdatePingSingle(mActual,
-                                     roundM,
-                                     vHeadSize,
-                                     isFirstKvTile);     //* 更新UB，同时累加到总out上
-                    if (hasPongTile) {
-                        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
-                        /****** ATB: Update Pong Starts ******/
-                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
-                        UpdatePongSingle(mActual,
-                                         roundM,
-                                         vHeadSize,
-                                         false);     //* 更新UB，同时累加到总out上
-                    }
-                    // Every pair hands the arena back to the next Softmax Ping mask load.
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
                     if (!hasPongTile) {
                         break;
                     }
@@ -514,8 +430,6 @@ public:
 
 private:
     struct KvTileInfo {
-        uint32_t tileStartInPage;
-        uint32_t tileSize;
         uint32_t tilePageStart;
         uint32_t maskOffset;
         uint32_t pageIdxInSeq;
@@ -541,38 +455,163 @@ private:
         return lhs > rhs ? lhs : rhs;
     }
 
-    __aicore__ inline void AdvanceKvTileCursor(uint32_t &pageIdxInSeq,
-                                                    uint32_t &tileStartInPage,
-                                                    uint32_t kvTileSize,
-                                                    uint32_t pageSize) const
+    __aicore__ inline void BuildDirectPageTileInfo(KvTileInfo &tileInfo,
+                                                    uint32_t tileIdx,
+                                                    uint32_t pageSize,
+                                                    uint32_t maskRowOffset)
     {
-        tileStartInPage += kvTileSize;
-        if (tileStartInPage >= pageSize) {
-            ++pageIdxInSeq;
-            tileStartInPage = 0;
-        }
-    }
-
-    __aicore__ inline bool BuildKvTileInfoAtPosition(KvTileInfo &tileInfo,
-                                                     uint32_t pageIdxInSeq,
-                                                     uint32_t tileStartInPage,
-                                                     uint32_t kvTileSize,
-                                                     uint32_t pageSize,
-                                                     uint32_t visibleKvEnd,
-                                                     uint32_t maskRowOffset)
-    {
-        const uint32_t tilePageStart = pageIdxInSeq * pageSize + tileStartInPage;
-        if (tilePageStart >= visibleKvEnd) {
-            return false;
-        }
-
-        tileInfo.tileStartInPage = tileStartInPage;
-        tileInfo.tileSize = Min(kvTileSize, pageSize - tileStartInPage);
+        const uint32_t tilePageStart = tileIdx * pageSize;
+        // Direct-page tiling has exactly one KV tile in each physical page.
+        // The final visible page still computes pageSize rows and relies on the
+        // established attention mask for its invalid tail.
         tileInfo.tilePageStart = tilePageStart;
         tileInfo.maskOffset =
             ((tilePageStart >> 4) * tilingData->maskRowSize << 4) + maskRowOffset;
-        tileInfo.pageIdxInSeq = pageIdxInSeq;
-        return true;
+        tileInfo.pageIdxInSeq = tileIdx;
+    }
+
+    template <bool IsFirstKvTile>
+    __aicore__ inline void ProcessKvTilePair(uint32_t qHistoryStart,
+                                             uint32_t qTokenStart,
+                                             uint32_t qHeadStart,
+                                             uint32_t realQBlockRows,
+                                             uint32_t mActual,
+                                             uint32_t roundM,
+                                             uint32_t qkHeadSize,
+                                             uint32_t gqaGroupSize,
+                                             uint32_t pageSize,
+                                             uint32_t vHeadSize,
+                                             uint32_t tilePairStart,
+                                             const KvTileInfo &pingTile,
+                                             bool hasPongTile,
+                                             const KvTileInfo &pongTile,
+                                             uint32_t pingKeyOffset,
+                                             uint32_t pingValueOffset,
+                                             bool usePingKvReuse,
+                                             bool usePongKvReuse,
+                                             bool fillPongKvReuse,
+                                             bool loadPingKvFromGm,
+                                             uint32_t blockTableBatchOffset,
+                                             bool blockTableCacheActive,
+                                             uint32_t keyPhysicalPageStride,
+                                             uint32_t valuePhysicalPageStride,
+                                             uint32_t keyGroupBase,
+                                             uint32_t valueGroupBase,
+                                             bool &outputReusePending)
+    {
+        constexpr bool isFirstKvTile = IsFirstKvTile;
+        const uint32_t pongTileIdx = tilePairStart + 1;
+
+        /****** ATB: Bmm1 Ping Start ******/
+        Bmm1PingSingle(isFirstKvTile,
+                       isFirstKvTile,
+                       hasPongTile,
+                       qTokenStart,
+                       qHeadStart,
+                       realQBlockRows,
+                       mActual,
+                       roundM,
+                       qkHeadSize,
+                       gqaGroupSize,
+                       pingTile.maskOffset,
+                       pingKeyOffset,
+                       pingValueOffset,
+                       pageSize,
+                       pageSize,
+                       vHeadSize,
+                       usePingKvReuse,
+                       loadPingKvFromGm,
+                       tilePairStart);
+        if (hasPongTile) {
+            const bool loadPongKvFromGm = !usePongKvReuse || fillPongKvReuse;
+            uint32_t pongKeyOffset = 0;
+            uint32_t pongValueOffset = 0;
+            if (loadPongKvFromGm) {
+                const uint32_t physicalPageIdx = GetPhysicalPageIdx(
+                    pongTile.pageIdxInSeq,
+                    blockTableBatchOffset,
+                    blockTableCacheActive);
+                pongKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase;
+                pongValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase;
+            }
+            /****** ATB: Bmm1 Pong Starts ******/
+            Bmm1PongSingle(false,
+                           isFirstKvTile,
+                           false,
+                           qTokenStart,
+                           qHeadStart,
+                           realQBlockRows,
+                           mActual,
+                           roundM,
+                           qkHeadSize,
+                           gqaGroupSize,
+                           pongTile.maskOffset,
+                           pongKeyOffset,
+                           pongValueOffset,
+                           pageSize,
+                           pageSize,
+                           vHeadSize,
+                           usePongKvReuse,
+                           loadPongKvFromGm,
+                           pongTileIdx);
+        }
+
+        /****** ATB: Softmax Ping Starts ******/
+        // R2+R3 owner sequence for one pair is:
+        // Softmax Ping -> Softmax Pong (optional) -> Update Ping -> Update Pong (optional).
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
+        SoftmaxPingSingle(qHistoryStart,
+                          pingTile.tilePageStart,
+                          realQBlockRows,
+                          mActual,
+                          roundM,
+                          gqaGroupSize,
+                          pageSize,
+                          isFirstKvTile);
+        if (hasPongTile) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
+            SoftmaxPongSingle(qHistoryStart,
+                              pongTile.tilePageStart,
+                              realQBlockRows,
+                              mActual,
+                              roundM,
+                              gqaGroupSize,
+                              pageSize,
+                              false);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
+
+        /****** ATB: Bmm2 Ping Starts ******/
+        Bmm2PingSingle(mActual,
+                       roundM,
+                       pageSize,
+                       vHeadSize,
+                       usePingKvReuse,
+                       tilePairStart);
+        if (hasPongTile) {
+            Bmm2PongSingle(mActual,
+                           roundM,
+                           pageSize,
+                           vHeadSize,
+                           usePongKvReuse,
+                           pongTileIdx);
+        }
+
+        /****** ATB: Update Ping Starts ******/
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
+        if (isFirstKvTile && outputReusePending) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
+            outputReusePending = false;
+        }
+        UpdatePingSingle(mActual, roundM, vHeadSize, isFirstKvTile);
+        if (hasPongTile) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
+            UpdatePongSingle(mActual, roundM, vHeadSize, false);
+        }
+        // Every pair hands the arena back to the next Softmax Ping mask load.
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
     }
 
     __aicore__ inline bool PrefetchBlockTable(uint32_t blockTableBatchOffset,

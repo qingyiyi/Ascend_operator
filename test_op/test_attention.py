@@ -270,6 +270,7 @@ def test_paged_attention(
     page_size=128,
     seq_lengths_host=None,
     kv_lengths_host=None,
+    case_name=None,
 ):
     assert batch_kv_len >= batch_seq_len
 
@@ -348,13 +349,14 @@ def test_paged_attention(
     profile_level = int(os.getenv("PROFILE_LEVEL", "1"))
     profile_repeat = int(os.getenv("PROFILE_REPEAT", "10"))
     profile_warmup = int(os.getenv("PROFILE_WARMUP", "3"))
-    profile_dir = os.getenv("PROFILE_DIR", "profiler_attention")
+    profile_root = os.getenv("PROFILE_DIR", "profiler_attention")
+    profile_dir = os.path.join(profile_root, case_name) if case_name else profile_root
     if profile_enabled:
         os.makedirs(profile_dir, exist_ok=True)
         print(
-            f"\nPROFILE enabled: target={target or 'env flags'}, "
-            f"repeat={profile_repeat}, warmup={profile_warmup}, "
-            f"level={profile_level}, dir={profile_dir}"
+            f"\nPROFILE enabled: case={case_name or 'default'}, "
+            f"target={target or 'env flags'}, repeat={profile_repeat}, "
+            f"warmup={profile_warmup}, level={profile_level}, dir={profile_dir}"
         )
 
     if profile_mix_v3:
@@ -388,8 +390,44 @@ def test_paged_attention(
     compare_outputs("mix_v3", out_mix_v3, out_splitfuse, ref_name="splitfuse")
 
 
+def run_model_profile_cases():
+    # Keep the formal profiler matrix small and model-representative.
+    # Qwen3-30B-A3B attention shape: 32 Q heads / 4 KV heads / 128 head dim.
+    test_paged_attention(
+        1, 1, 8192, 32, 4, 128, 128, [1], [8192],
+        case_name="qwen3_30b_a3b_decode_q1_kv8k",
+    )
+    test_paged_attention(
+        1, 512, 512, 32, 4, 128, 128, [512], [512],
+        case_name="qwen3_30b_a3b_prefill_q512",
+    )
+    test_paged_attention(
+        1, 128, 8192, 32, 4, 128, 128, [128], [8192],
+        case_name="qwen3_30b_a3b_chunk_q128_kv8k",
+    )
+
+    # GLM-4.5-Air and GLM-4.6 share the same attention dimensions:
+    # 96 Q heads / 8 KV heads / 128 head dim.
+    test_paged_attention(
+        1, 1, 8192, 96, 8, 128, 128, [1], [8192],
+        case_name="glm_96h_8kv_decode_q1_kv8k",
+    )
+    test_paged_attention(
+        1, 512, 512, 96, 8, 128, 128, [512], [512],
+        case_name="glm_96h_8kv_prefill_q512",
+    )
+    test_paged_attention(
+        1, 128, 8192, 96, 8, 128, 128, [128], [8192],
+        case_name="glm_96h_8kv_chunk_q128_kv8k",
+    )
+
+
 def main():
-    main_repeat = 1 if is_profile_enabled() else int(os.getenv("TEST_REPEAT", "1"))
+    # if is_profile_enabled():
+    #     run_model_profile_cases()
+    #     return
+
+    main_repeat = int(os.getenv("TEST_REPEAT", "1"))
     for _ in range(main_repeat):
         # P4 exact 128-row slices with one visible KV tile.
         # test_paged_attention(2, 256, 512, 32, 4, 128, 128, [128, 128], [128, 128])
