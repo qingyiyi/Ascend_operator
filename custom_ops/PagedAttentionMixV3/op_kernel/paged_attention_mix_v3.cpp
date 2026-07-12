@@ -6,15 +6,20 @@ constexpr uint32_t VEC_SIZE_IN_BYTES = 8 * DATA_BLOCK_BYTES;
 constexpr uint32_t FLOATS_PER_VECTOR_REPEAT = VEC_SIZE_IN_BYTES / sizeof(float);
 constexpr uint32_t HALFS_PER_VECTOR_REPEAT = VEC_SIZE_IN_BYTES / sizeof(half);
 constexpr uint32_t CUBE_BLOCK_SIZE = 16;
-// The ND accumulator is the main layout difference from ATB's NZ goUbuf.
-// Keep every strided ND vector command within the already-verified P3 row span.
-constexpr uint32_t ND_ROW_REPEAT_CHUNK = CUBE_BLOCK_SIZE;
+// Keep the persistent output numerator in the same C0/NZ order produced by
+// BMM2: [vBlock][row][C0]. This avoids folding every KV tile into ND. The
+// public output remains ND and is converted only once during the final write.
 constexpr uint32_t MAX_Q_ROWS_PER_GROUP = 128;
 constexpr uint32_t Q_BLOCK_ROWS = MAX_Q_ROWS_PER_GROUP;
 constexpr uint32_t CUBE_MATRIX_SIZE = CUBE_BLOCK_SIZE * CUBE_BLOCK_SIZE;
 constexpr uint32_t MAX_GQA_TILE_SIZE = 8;
 constexpr uint32_t KV_TILE_SIZE = 128;
 constexpr uint32_t MAX_V_HEAD_SIZE = 128;
+// P6a reserves a bounded L1 arena for immutable KV tiles owned by the first
+// batch/KV-head group handled by each AI Core. The tile count is derived from
+// the runtime head sizes; no page-size or model-shape special case is used.
+constexpr uint32_t KV_REUSE_CACHE_BYTES = 128 * 1024;
+constexpr uint32_t MAX_KV_REUSE_CACHE_TILES = 8;
 constexpr uint32_t UB_REGION_BYTES = 32 * 1024;
 constexpr uint32_t UB_SCORE_PING_OFFSET = 0 * UB_REGION_BYTES;
 constexpr uint32_t UB_SCORE_PONG_OFFSET = 1 * UB_REGION_BYTES;
@@ -32,6 +37,8 @@ constexpr uint32_t UB_TOTAL_BYTES = UB_OUTPUT_OFFSET +
                                     MAX_Q_ROWS_PER_GROUP * MAX_V_HEAD_SIZE * sizeof(float);
 constexpr float SOFTMAX_INIT_MIN = -65504.0F;
 
+static_assert(MAX_KV_REUSE_CACHE_TILES <= 32,
+              "KV reuse validity mask supports at most 32 cached tiles");
 static_assert(MAX_Q_ROWS_PER_GROUP * KV_TILE_SIZE * sizeof(half) <= UB_REGION_BYTES,
               "fp16 score/probability must fit in one 32 KiB UB slot");
 static_assert(MAX_Q_ROWS_PER_GROUP * KV_TILE_SIZE * sizeof(float) <= 2 * UB_REGION_BYTES,
@@ -178,6 +185,13 @@ public:
         // this token only after MTE3 has finished reading outF16Ub.
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
         bool outputReusePending = true;
+        // Keep the cache immutable after choosing its owner. This avoids any
+        // cache-overwrite synchronization in the hot path while still reusing
+        // K/V across consecutive q-head/q-slice tasks of the same KV group.
+        bool kvReuseOwnerValid = false;
+        uint32_t kvReuseOwnerBatch = 0;
+        uint32_t kvReuseOwnerGroup = 0;
+        uint32_t kvReuseValidMask = 0;
         
         for (uint32_t taskId = taskIdStart; taskId < taskIdEnd; ++taskId) {
             const uint32_t realQBlockRows = Min(qBlockRows, seqLen - qBlockStart);
@@ -193,33 +207,70 @@ public:
                 const uint32_t kvTileSize = Min(pageSize, KV_TILE_SIZE);
                 const uint32_t tilesPerPage = CeilDiv(pageSize, kvTileSize);
                 const uint32_t totalKvTiles = kvPageNum * tilesPerPage;
+                const uint32_t maskRowOffset = (qBatchOffset + qBlockStart) * CUBE_BLOCK_SIZE;
+                const uint32_t blockTableBatchOffset = batchIdx * pageNumPerBatch;
+                uint32_t cursorPageIdx = 0;
+                uint32_t cursorTileStartInPage = 0;
                 bool queryGuardConsumed = false;
                 for (uint32_t tilePairStart = 0; tilePairStart < totalKvTiles; tilePairStart += 2) {
                     KvTileInfo pingTile;
-                    if (!BuildKvTileInfo(pingTile,
-                                         tilePairStart,
-                                         tilesPerPage,
-                                         kvTileSize,
-                                         pageSize,
-                                         visibleKvEnd,
-                                         batchIdx,
-                                         pageNumPerBatch,
-                                         qBatchOffset,
-                                         qBlockStart)) {
+                    if (!BuildKvTileInfoAtPosition(pingTile,
+                                                   cursorPageIdx,
+                                                   cursorTileStartInPage,
+                                                   kvTileSize,
+                                                   pageSize,
+                                                   visibleKvEnd,
+                                                   maskRowOffset,
+                                                   blockTableBatchOffset)) {
                         break;
                     }
+                    AdvanceKvTileCursor(cursorPageIdx,
+                                        cursorTileStartInPage,
+                                        kvTileSize,
+                                        pageSize);
 
                     KvTileInfo pongTile;
-                    const bool hasPongTile = BuildKvTileInfo(pongTile,
-                                                             tilePairStart + 1,
-                                                             tilesPerPage,
-                                                             kvTileSize,
-                                                             pageSize,
-                                                             visibleKvEnd,
-                                                             batchIdx,
-                                                             pageNumPerBatch,
-                                                             qBatchOffset,
-                                                             qBlockStart);
+                    const bool hasPongTile = tilePairStart + 1 < totalKvTiles &&
+                                             BuildKvTileInfoAtPosition(pongTile,
+                                                                       cursorPageIdx,
+                                                                       cursorTileStartInPage,
+                                                                       kvTileSize,
+                                                                       pageSize,
+                                                                       visibleKvEnd,
+                                                                       maskRowOffset,
+                                                                       blockTableBatchOffset);
+                    if (hasPongTile) {
+                        AdvanceKvTileCursor(cursorPageIdx,
+                                            cursorTileStartInPage,
+                                            kvTileSize,
+                                            pageSize);
+                    }
+
+                    if (!kvReuseOwnerValid && kvReuseCacheTileCount != 0) {
+                        kvReuseOwnerValid = true;
+                        kvReuseOwnerBatch = batchIdx;
+                        kvReuseOwnerGroup = groupIdx;
+                    }
+                    const bool isKvReuseOwner = kvReuseOwnerValid &&
+                                                batchIdx == kvReuseOwnerBatch &&
+                                                groupIdx == kvReuseOwnerGroup;
+                    const bool usePingKvReuse = isKvReuseOwner &&
+                                                tilePairStart < kvReuseCacheTileCount;
+                    const uint32_t pingKvReuseBit = usePingKvReuse ? (1U << tilePairStart) : 0U;
+                    const bool fillPingKvReuse = usePingKvReuse &&
+                                                 (kvReuseValidMask & pingKvReuseBit) == 0;
+                    if (fillPingKvReuse) {
+                        kvReuseValidMask |= pingKvReuseBit;
+                    }
+                    const uint32_t pongTileIdx = tilePairStart + 1;
+                    const bool usePongKvReuse = hasPongTile && isKvReuseOwner &&
+                                                pongTileIdx < kvReuseCacheTileCount;
+                    const uint32_t pongKvReuseBit = usePongKvReuse ? (1U << pongTileIdx) : 0U;
+                    const bool fillPongKvReuse = usePongKvReuse &&
+                                                 (kvReuseValidMask & pongKvReuseBit) == 0;
+                    if (fillPongKvReuse) {
+                        kvReuseValidMask |= pongKvReuseBit;
+                    }
 
                     /****** ATB: Bmm1 Ping Start ******/
                     queryGuardConsumed = queryGuardConsumed || pingTile.isFirstKvTile;
@@ -239,7 +290,10 @@ public:
                                    pageSize,
                                    pingTile.tileStartInPage,
                                    pingTile.tileSize,
-                                   vHeadSize);
+                                   vHeadSize,
+                                   usePingKvReuse,
+                                   fillPingKvReuse,
+                                   tilePairStart);
                     if (hasPongTile) {
                         /****** ATB: Bmm1 Pong Starts ******/
                         Bmm1PongSingle(false,
@@ -258,7 +312,10 @@ public:
                                        pageSize,
                                        pongTile.tileStartInPage,
                                        pongTile.tileSize,
-                                       vHeadSize);
+                                       vHeadSize,
+                                       usePongKvReuse,
+                                       fillPongKvReuse,
+                                       pongTileIdx);
                     }
 
                     /****** ATB: Softmax Ping Starts ******/
@@ -300,13 +357,17 @@ public:
                     Bmm2PingSingle(mActual,
                                    roundM,
                                    pingTile.tileSize,
-                                   vHeadSize);     //* P*V
+                                   vHeadSize,
+                                   usePingKvReuse,
+                                   tilePairStart);     //* P*V
                     if (hasPongTile) {
                         /****** ATB: Bmm2 Pong Starts ******/
                         Bmm2PongSingle(mActual,
                                        roundM,
                                        pongTile.tileSize,
-                                       vHeadSize);     //* P*V
+                                       vHeadSize,
+                                       usePongKvReuse,
+                                       pongTileIdx);     //* P*V
                     }
 
                     /****** ATB: Update Ping Starts ******/
@@ -448,34 +509,40 @@ private:
         return lhs > rhs ? lhs : rhs;
     }
 
-    __aicore__ inline bool BuildKvTileInfo(KvTileInfo &tileInfo,
-                                           uint32_t tileLinearIdx,
-                                           uint32_t tilesPerPage,
-                                           uint32_t kvTileSize,
-                                           uint32_t pageSize,
-                                           uint32_t visibleKvEnd,
-                                           uint32_t batchIdx,
-                                           uint32_t pageNumPerBatch,
-                                           uint32_t qBatchOffset,
-                                           uint32_t qBlockStart)
+    __aicore__ inline void AdvanceKvTileCursor(uint32_t &pageIdxInSeq,
+                                                    uint32_t &tileStartInPage,
+                                                    uint32_t kvTileSize,
+                                                    uint32_t pageSize) const
     {
-        const uint32_t pageIdxInSeq = tileLinearIdx / tilesPerPage;
-        const uint32_t tileIdxInPage = tileLinearIdx - pageIdxInSeq * tilesPerPage;
-        const uint32_t tileStartInPage = tileIdxInPage * kvTileSize;
+        tileStartInPage += kvTileSize;
+        if (tileStartInPage >= pageSize) {
+            ++pageIdxInSeq;
+            tileStartInPage = 0;
+        }
+    }
+
+    __aicore__ inline bool BuildKvTileInfoAtPosition(KvTileInfo &tileInfo,
+                                                     uint32_t pageIdxInSeq,
+                                                     uint32_t tileStartInPage,
+                                                     uint32_t kvTileSize,
+                                                     uint32_t pageSize,
+                                                     uint32_t visibleKvEnd,
+                                                     uint32_t maskRowOffset,
+                                                     uint32_t blockTableBatchOffset)
+    {
         const uint32_t tilePageStart = pageIdxInSeq * pageSize + tileStartInPage;
         if (tilePageStart >= visibleKvEnd) {
             return false;
         }
 
         const uint32_t maskColBlock = tilePageStart / CUBE_BLOCK_SIZE;
-        const uint32_t maskRowStart = qBatchOffset + qBlockStart;
 
         tileInfo.pageIdxInSeq = pageIdxInSeq;
         tileInfo.tileStartInPage = tileStartInPage;
         tileInfo.tileSize = Min(kvTileSize, pageSize - tileStartInPage);
         tileInfo.tilePageStart = tilePageStart;
-        tileInfo.maskOffset = maskColBlock * tilingData->maskRowSize * CUBE_BLOCK_SIZE + maskRowStart * CUBE_BLOCK_SIZE;
-        tileInfo.physicalPageIdx = blockTableGm.GetValue(batchIdx * pageNumPerBatch + pageIdxInSeq);
+        tileInfo.maskOffset = maskColBlock * tilingData->maskRowSize * CUBE_BLOCK_SIZE + maskRowOffset;
+        tileInfo.physicalPageIdx = blockTableGm.GetValue(blockTableBatchOffset + pageIdxInSeq);
         tileInfo.isFirstKvTile = pageIdxInSeq == 0 && tileStartInPage == 0;
         return true;
     }
@@ -522,6 +589,11 @@ private:
         const uint32_t l1ProbBytes = l1ProbElements * sizeof(half);
         const uint32_t l1ValueElements = kvTileSize * tilingData->vHeadSize;
         const uint32_t l1ValueBytes = l1ValueElements * sizeof(DTYPE_VCACHE);
+        const uint32_t kvReuseTileBytes = l1KeyBytes + l1ValueBytes;
+        kvReuseCacheTileCount = Min(KV_REUSE_CACHE_BYTES / kvReuseTileBytes,
+                                    MAX_KV_REUSE_CACHE_TILES);
+        kvReuseKeyTileElements = l1KeyElements;
+        kvReuseValueTileElements = l1ValueElements;
         const uint32_t rowSize = mSize;
         const uint32_t maskSize = qBlockRows * kvTileSize;
         const uint32_t workSize = Max(kvTileSize * CUBE_BLOCK_SIZE, mSize * CUBE_BLOCK_SIZE);
@@ -549,6 +621,11 @@ private:
         pipe.InitBuffer(scoreL0CBuf, 2 * l0cBytes);
         pipe.InitBuffer(probL1Buf, 2 * l1ProbBytes);
         pipe.InitBuffer(valueL1Buf, 2 * l1ValueBytes);
+        // Reserve a fixed, parameter-independent L1 arena. A tile may be too
+        // large to cache, in which case kvReuseCacheTileCount is zero and the
+        // normal ping/pong path remains active. InitBuffer must not receive a
+        // runtime-computed zero-byte size.
+        pipe.InitBuffer(kvReuseL1Buf, KV_REUSE_CACHE_BYTES);
         pipe.InitBuffer(ubBuf, UB_TOTAL_BYTES);
 
         queryL0APing = queryL0ABuf.Get<DTYPE_QUERY>();
@@ -609,6 +686,12 @@ private:
         probL1Pong = probL1Ping[l1ProbElements];
         valueL1Ping = valueL1Buf.Get<DTYPE_VCACHE>();
         valueL1Pong = valueL1Ping[l1ValueElements];
+        // Split the cache arena in bytes rather than in K/V elements. This is
+        // correct even when the K and V cache element types have different sizes.
+        AscendC::LocalTensor<uint8_t> kvReuseBase = kvReuseL1Buf.Get<uint8_t>();
+        kvReuseKeyL1 = kvReuseBase.ReinterpretCast<DTYPE_KCACHE>();
+        kvReuseValueL1 =
+            kvReuseBase[kvReuseCacheTileCount * l1KeyBytes].ReinterpretCast<DTYPE_VCACHE>();
     }
 
     __aicore__ inline uint32_t NzMatrixElementCount(uint32_t rowCount, uint32_t colCount) const
@@ -788,7 +871,10 @@ private:
                                           uint32_t fullPageSize,
                                           uint32_t tileStartInPage,
                                           uint32_t tileSize,
-                                          uint32_t vHeadSize)
+                                          uint32_t vHeadSize,
+                                          bool useKvReuse,
+                                          bool fillKvReuse,
+                                          uint32_t kvReuseTileIdx)
     {
         /****** ATB: Bmm1 Ping / QK LOAD + Mask PRELOAD + V PRELOAD ******/
         Bmm1Single(loadQueryFromGm,
@@ -809,6 +895,9 @@ private:
                    tileStartInPage,
                    tileSize,
                    vHeadSize,
+                   useKvReuse,
+                   fillKvReuse,
+                   kvReuseTileIdx,
                    Pingflag,
                    PingflagPlus2,
                    PingflagPlus4,
@@ -837,7 +926,10 @@ private:
                                           uint32_t fullPageSize,
                                           uint32_t tileStartInPage,
                                           uint32_t tileSize,
-                                          uint32_t vHeadSize)
+                                          uint32_t vHeadSize,
+                                          bool useKvReuse,
+                                          bool fillKvReuse,
+                                          uint32_t kvReuseTileIdx)
     {
         /****** ATB: Bmm1 Pong / QK LOAD + Mask PRELOAD + V PRELOAD ******/
         Bmm1Single(loadQueryFromGm,
@@ -858,6 +950,9 @@ private:
                    tileStartInPage,
                    tileSize,
                    vHeadSize,
+                   useKvReuse,
+                   fillKvReuse,
+                   kvReuseTileIdx,
                    Pongflag,
                    PongflagPlus2,
                    PongflagPlus4,
@@ -888,6 +983,9 @@ private:
                                       uint32_t tileStartInPage,
                                       uint32_t tileSize,
                                       uint32_t vHeadSize,
+                                      bool useKvReuse,
+                                      bool fillKvReuse,
+                                      uint32_t kvReuseTileIdx,
                                       decltype(Pingflag) mainFlag,
                                       decltype(Pingflag) plus2Flag,
                                       decltype(Pingflag) plus4Flag,
@@ -923,33 +1021,47 @@ private:
         LoadQueryToL0A(slotQueryL0A, mActual, roundM, qkHeadSize);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(mainFlag);
 
-        // Load K GM ——> L1
+        // Keep the normal ping/pong event schedule for both cache hits and
+        // misses. This mirrors ATB's initKV protocol: only the GM->L1 copy is
+        // conditional, while the ready/ownership tokens remain unchanged.
+        AscendC::LocalTensor<DTYPE_KCACHE> keyL1Source = slotKeyL1;
+        if (useKvReuse) {
+            keyL1Source = kvReuseKeyL1[kvReuseTileIdx * kvReuseKeyTileElements];
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(plus4Flag);
-        CopyKeyToL1(slotKeyL1,
-                    physicalPageIdx,
-                    groupIdx,
-                    fullPageSize,
-                    tileStartInPage,
-                    tileSize,
-                    qkHeadSize);
+        if (!useKvReuse || fillKvReuse) {
+            CopyKeyToL1(keyL1Source,
+                        physicalPageIdx,
+                        groupIdx,
+                        fullPageSize,
+                        tileStartInPage,
+                        tileSize,
+                        qkHeadSize);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(mainFlag);
-
-        // Load K GM ——> L0b  (分别解开前一个硬件和后一个硬件的保护，同时阻塞前一个硬件和后一个硬件，以防止冲突)
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(mainFlag);
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(plus2Flag);
-        LoadKeyToL0B(slotKeyL0B, slotKeyL1, tileSize, qkHeadSize);        //* 由于 K(NZ) = K^T(ZN) 所以这里不需要转置
+        LoadKeyToL0B(slotKeyL0B, keyL1Source, tileSize, qkHeadSize);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(plus4Flag);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(plus2Flag);
 
-        // Load V GM ——> L1
+        // Preserve the original BMM1 V preload. Cache hits skip only GM->L1;
+        // Ping/Pong still publish their own plus4 ready token for BMM2, so the
+        // transfer remains overlapped instead of becoming a BMM2 dependency.
+        AscendC::LocalTensor<DTYPE_VCACHE> valueL1Source = slotValueL1;
+        if (useKvReuse) {
+            valueL1Source = kvReuseValueL1[kvReuseTileIdx * kvReuseValueTileElements];
+        }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(plus6Flag);
-        CopyValueToL1(slotValueL1,
-                      physicalPageIdx,
-                      groupIdx,
-                      fullPageSize,
-                      tileStartInPage,
-                      tileSize,
-                      vHeadSize);
+        if (!useKvReuse || fillKvReuse) {
+            CopyValueToL1(valueL1Source,
+                          physicalPageIdx,
+                          groupIdx,
+                          fullPageSize,
+                          tileStartInPage,
+                          tileSize,
+                          vHeadSize);
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(plus4Flag);
 
         // MMAD
@@ -1344,7 +1456,7 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
 
             BroadcastRows(workUb, mScaleUb, roundM);
-            MulRows(outUb, outUb, workUb, mActual, vHeadSize);       //* 更新旧输出分子
+            MulNzRows(outUb, outUb, workUb, mActual, roundM, vHeadSize);       //* 更新旧输出分子
         }
     }
 
@@ -1670,43 +1782,32 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void MulRows(AscendC::LocalTensor<float> dst,
-                                   AscendC::LocalTensor<float> src0,
-                                   AscendC::LocalTensor<float> src1,
-                                   uint32_t rowCount,
-                                   uint32_t colCount)
+    __aicore__ inline void MulNzRows(AscendC::LocalTensor<float> dst,
+                                     AscendC::LocalTensor<float> src0,
+                                     AscendC::LocalTensor<float> rowScaleC0,
+                                     uint32_t rowCount,
+                                     uint32_t roundM,
+                                     uint32_t colCount)
     {
+        // outUb is [nBlock][roundM][C0]. BroadcastRows stores one fp32
+        // data block (8 copies) per row; src1BlkStride=0 broadcasts it over
+        // both fp32 blocks of C0 while src1RepStride advances to the next row.
         AscendC::BinaryRepeatParams params;
         params.dstBlkStride = 1;
         params.src0BlkStride = 1;
         params.src1BlkStride = 0;
-        params.dstRepStride = static_cast<uint16_t>(colCount * sizeof(float) / DATA_BLOCK_BYTES);
-        params.src0RepStride = static_cast<uint16_t>(colCount * sizeof(float) / DATA_BLOCK_BYTES);
+        params.dstRepStride = CUBE_BLOCK_SIZE * sizeof(float) / DATA_BLOCK_BYTES;
+        params.src0RepStride = params.dstRepStride;
         params.src1RepStride = 1;
 
-        const uint32_t simdSize = VEC_SIZE_IN_BYTES / sizeof(float);
-        const uint32_t broadcastBlockSize = DATA_BLOCK_BYTES / sizeof(float);
-        for (uint32_t rowStart = 0; rowStart < rowCount; rowStart += ND_ROW_REPEAT_CHUNK) {
-            const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, rowCount - rowStart));
-            const uint32_t rowOffset = rowStart * colCount;
-            const uint32_t scaleOffset = rowStart * broadcastBlockSize;
-            uint32_t colOffset = 0;
-            for (; colOffset + simdSize <= colCount; colOffset += simdSize) {
-                AscendC::Mul(dst[rowOffset + colOffset],
-                             src0[rowOffset + colOffset],
-                             src1[scaleOffset],
-                             simdSize,
-                             repeat,
-                             params);
-            }
-            if (colOffset < colCount) {
-                AscendC::Mul(dst[rowOffset + colOffset],
-                             src0[rowOffset + colOffset],
-                             src1[scaleOffset],
-                             colCount - colOffset,
-                             repeat,
-                             params);
-            }
+        for (uint32_t colBlock = 0; colBlock < colCount / CUBE_BLOCK_SIZE; ++colBlock) {
+            const uint32_t blockOffset = colBlock * roundM * CUBE_BLOCK_SIZE;
+            AscendC::Mul(dst[blockOffset],
+                         src0[blockOffset],
+                         rowScaleC0,
+                         CUBE_BLOCK_SIZE,
+                         static_cast<uint8_t>(rowCount),
+                         params);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -1775,14 +1876,18 @@ private:
 
     __aicore__ inline void Bmm2PingSingle(uint32_t mActual,
                                           uint32_t roundM,
-                                          uint32_t pageSize,
-                                          uint32_t vHeadSize)
+                                          uint32_t tileSize,
+                                          uint32_t vHeadSize,
+                                          bool useKvReuse,
+                                          uint32_t kvReuseTileIdx)
     {
         /****** ATB: Bmm2 Ping / V L1->L0B + P L1->L0A + P*V MMAD ******/
         Bmm2Single(mActual,
                    roundM,
-                   pageSize,
+                   tileSize,
                    vHeadSize,
+                   useKvReuse,
+                   kvReuseTileIdx,
                    Pingflag,
                    PingflagPlus2,
                    PingflagPlus6,
@@ -1796,14 +1901,18 @@ private:
 
     __aicore__ inline void Bmm2PongSingle(uint32_t mActual,
                                           uint32_t roundM,
-                                          uint32_t pageSize,
-                                          uint32_t vHeadSize)
+                                          uint32_t tileSize,
+                                          uint32_t vHeadSize,
+                                          bool useKvReuse,
+                                          uint32_t kvReuseTileIdx)
     {
         /****** ATB: Bmm2 Pong / V L1->L0B + P L1->L0A + P*V MMAD ******/
         Bmm2Single(mActual,
                    roundM,
-                   pageSize,
+                   tileSize,
                    vHeadSize,
+                   useKvReuse,
+                   kvReuseTileIdx,
                    Pongflag,
                    PongflagPlus2,
                    PongflagPlus6,
@@ -1817,8 +1926,10 @@ private:
 
     __aicore__ inline void Bmm2Single(uint32_t mActual,
                                       uint32_t roundM,
-                                      uint32_t pageSize,
+                                      uint32_t tileSize,
                                       uint32_t vHeadSize,
+                                      bool useKvReuse,
+                                      uint32_t kvReuseTileIdx,
                                       decltype(Pingflag) mainFlag,
                                       decltype(Pingflag) plus2Flag,
                                       decltype(Pingflag) plus6Flag,
@@ -1829,9 +1940,20 @@ private:
                                       AscendC::LocalTensor<half> slotProbL1,
                                       AscendC::LocalTensor<float> slotOutL0C)
     {
-        Bmm2LoadValueToL0B(slotValueL0B, slotValueL1, pageSize, vHeadSize, plus2Flag, plus6Flag, plus4Flag);
-        Bmm2LoadProbToL0A(slotProbL0A, slotProbL1, mActual, roundM, pageSize, mainFlag);
-        Bmm2Mmad(slotOutL0C, slotProbL0A, slotValueL0B, mActual, pageSize, vHeadSize, mainFlag, plus2Flag);
+        AscendC::LocalTensor<DTYPE_VCACHE> valueL1Source = slotValueL1;
+        if (useKvReuse) {
+            valueL1Source = kvReuseValueL1[kvReuseTileIdx * kvReuseValueTileElements];
+        }
+        Bmm2LoadValueToL0B(slotValueL0B,
+                           valueL1Source,
+                           tileSize,
+                           vHeadSize,
+                           plus2Flag,
+                           plus6Flag,
+                           plus4Flag);
+        Bmm2LoadProbToL0A(slotProbL0A, slotProbL1, mActual, roundM, tileSize, mainFlag);
+        Bmm2Mmad(slotOutL0C, slotProbL0A, slotValueL0B,
+                 mActual, tileSize, vHeadSize, mainFlag, plus2Flag);
     }
 
     __aicore__ inline void UpdatePingSingle(uint32_t mActual,
@@ -1996,56 +2118,21 @@ private:
                                               decltype(Pingflag) mainFlag)
     {
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(mainFlag);
-        if (isFirstKvTile) {
-            AscendC::SetVectorMask<int8_t>((uint64_t)0x0, (uint64_t)0xffff);
-            for (uint32_t nOffset = 0; nOffset < chunkCols; nOffset += CUBE_BLOCK_SIZE) {
-                CopyPvChunkToOut(outUb[chunkStart + nOffset], pvUb[nOffset * roundM], mActual, vHeadSize);
-            }
-            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-            return;
-        }
 
-        AscendC::BinaryRepeatParams addParams;
-        addParams.dstBlkStride = 1;
-        addParams.src0BlkStride = 1;
-        addParams.src1BlkStride = 1;
-        addParams.dstRepStride = static_cast<uint16_t>(vHeadSize * sizeof(float) / DATA_BLOCK_BYTES);
-        addParams.src0RepStride = static_cast<uint16_t>(vHeadSize * sizeof(float) / DATA_BLOCK_BYTES);
-        addParams.src1RepStride = static_cast<uint16_t>(CUBE_BLOCK_SIZE * sizeof(float) / DATA_BLOCK_BYTES);
+        // BMM2's L0C->UB result and the persistent accumulator now share the
+        // same [nBlock][row][C0] order. Accumulate each C0 block directly; no
+        // per-row NZ->ND fold is needed on every KV tile.
         for (uint32_t nOffset = 0; nOffset < chunkCols; nOffset += CUBE_BLOCK_SIZE) {
-            for (uint32_t rowStart = 0; rowStart < mActual; rowStart += ND_ROW_REPEAT_CHUNK) {
-                const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, mActual - rowStart));
-                const uint32_t outOffset = rowStart * vHeadSize + chunkStart + nOffset;
-                const uint32_t pvOffset = nOffset * roundM + rowStart * CUBE_BLOCK_SIZE;
-                AscendC::Add(outUb[outOffset],
-                             outUb[outOffset],
-                             pvUb[pvOffset],
-                             CUBE_BLOCK_SIZE,
-                             repeat,
-                             addParams);    //* 写回UB，同时累加到总out上
+            const uint32_t dstOffset = (chunkStart + nOffset) * roundM;
+            const uint32_t srcOffset = nOffset * roundM;
+            const uint32_t count = mActual * CUBE_BLOCK_SIZE;
+            if (isFirstKvTile) {
+                CopyVectorFloat(outUb[dstOffset], pvUb[srcOffset], count);
+            } else {
+                AscendC::Add(outUb[dstOffset], outUb[dstOffset], pvUb[srcOffset], count);
             }
         }
-    }
-
-    __aicore__ inline void CopyPvChunkToOut(AscendC::LocalTensor<float> dst,
-                                            AscendC::LocalTensor<float> src,
-                                            uint32_t mActual,
-                                            uint32_t vHeadSize)
-    {
-        const AscendC::UnaryRepeatParams copyParams(
-            1,
-            1,
-            static_cast<uint16_t>(vHeadSize * sizeof(float) / DATA_BLOCK_BYTES),
-            static_cast<uint16_t>(CUBE_BLOCK_SIZE * sizeof(float) / DATA_BLOCK_BYTES));
-        for (uint32_t rowStart = 0; rowStart < mActual; rowStart += ND_ROW_REPEAT_CHUNK) {
-            const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, mActual - rowStart));
-            AscendC::Adds<float, false>(dst[rowStart * vHeadSize],
-                                        src[rowStart * CUBE_BLOCK_SIZE],
-                                        0.0F,
-                                        (uint64_t)0,
-                                        repeat,
-                                        copyParams);
-        }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void NormalizeAndWriteOutput(uint32_t outputOffset,
@@ -2054,97 +2141,43 @@ private:
                                                    uint32_t qHeadNum,
                                                    uint32_t vHeadSize)
     {
-        BroadcastRows(workUb, lOrgUb, roundM);
-
-        DivRows(outUb, outUb, workUb, mActual, vHeadSize);       //* output = outUB / l0rgUB
-
-        CastFloatToHalfChunked(outF16Ub, outUb, mActual * vHeadSize);
+        // Keep ATB's fp16 final normalization while preserving the internal
+        // [vBlock][row][C0] layout. Each block is contiguous, so cast/div are
+        // dense vector operations. Only the final MTE3 copies scatter C0 blocks
+        // into the public ND [token, qHead, vDim] tensor.
+        CastFloatToHalfChunked(mNewF16Ub, lOrgUb, roundM);
         AscendC::PipeBarrier<PIPE_V>();
+        ExpandToC0BlockHalf(workF16Ub, mNewF16Ub, roundM);
+
+        for (uint32_t colStart = 0; colStart < vHeadSize; colStart += CUBE_BLOCK_SIZE) {
+            const uint32_t blockOffset = colStart * roundM;
+            const uint32_t blockElements = mActual * CUBE_BLOCK_SIZE;
+            CastFloatToHalfChunked(outF16Ub[blockOffset], outUb[blockOffset], blockElements);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Div(outF16Ub[blockOffset],
+                         outF16Ub[blockOffset],
+                         workF16Ub,
+                         blockElements);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
-        AscendC::DataCopy(outputGm[outputOffset],
-                          outF16Ub,
-                          AscendC::DataCopyParams(
-                              static_cast<uint16_t>(mActual),
-                              static_cast<uint16_t>(vHeadSize * sizeof(DTYPE_OUTPUT) / DATA_BLOCK_BYTES),
-                              0,
-                              static_cast<uint16_t>((qHeadNum - 1) * vHeadSize *
-                                                    sizeof(DTYPE_OUTPUT) / DATA_BLOCK_BYTES)));
-        // Return ownership of outF16Ub/scoreF16UbPong to Vector only after the
-        // asynchronous MTE3 write has consumed the source. The next task waits
-        // at its first actual reuse instead of draining every hardware pipe.
+        const uint16_t dstStride = static_cast<uint16_t>(
+            (qHeadNum * vHeadSize - CUBE_BLOCK_SIZE) *
+            sizeof(DTYPE_OUTPUT) / DATA_BLOCK_BYTES);
+        for (uint32_t colStart = 0; colStart < vHeadSize; colStart += CUBE_BLOCK_SIZE) {
+            AscendC::DataCopy(outputGm[outputOffset + colStart],
+                              outF16Ub[colStart * roundM],
+                              AscendC::DataCopyParams(
+                                  static_cast<uint16_t>(mActual),
+                                  1,
+                                  0,
+                                  dstStride));
+        }
+        // Return ownership of outF16Ub/scoreF16UbPong only after all C0 writes
+        // have consumed the source. The next task waits at its first reuse.
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
-    }
-
-    __aicore__ inline void DivRows(AscendC::LocalTensor<float> dst,
-                                   AscendC::LocalTensor<float> src0,
-                                   AscendC::LocalTensor<float> src1,
-                                   uint32_t rowCount,
-                                   uint32_t colCount)
-    {
-        AscendC::BinaryRepeatParams params;
-        params.dstBlkStride = 1;
-        params.src0BlkStride = 1;
-        params.src1BlkStride = 0;
-        const uint32_t simdSize = VEC_SIZE_IN_BYTES / sizeof(float);
-        const uint32_t broadcastBlockSize = DATA_BLOCK_BYTES / sizeof(float);
-        if (colCount % broadcastBlockSize != 0) {
-            params.dstRepStride = 0;
-            params.src0RepStride = 0;
-            params.src1RepStride = 0;
-            for (uint32_t row = 0; row < rowCount; ++row) {
-                const uint32_t rowOffset = row * colCount;
-                const uint32_t divisorOffset = row * broadcastBlockSize;
-                uint32_t colOffset = 0;
-                for (; colOffset + simdSize <= colCount; colOffset += simdSize) {
-                    AscendC::Div(dst[rowOffset + colOffset],
-                                 src0[rowOffset + colOffset],
-                                 src1[divisorOffset],
-                                 simdSize,
-                                 1,
-                                 params);
-                }
-                if (colOffset < colCount) {
-                    AscendC::Div(dst[rowOffset + colOffset],
-                                 src0[rowOffset + colOffset],
-                                 src1[divisorOffset],
-                                 colCount - colOffset,
-                                 1,
-                                 params);
-                }
-            }
-            AscendC::PipeBarrier<PIPE_V>();
-            return;
-        }
-
-        const uint16_t rowStride = static_cast<uint16_t>(colCount / broadcastBlockSize);
-        params.dstRepStride = rowStride;
-        params.src0RepStride = rowStride;
-        params.src1RepStride = 1;
-
-        for (uint32_t rowStart = 0; rowStart < rowCount; rowStart += ND_ROW_REPEAT_CHUNK) {
-            const uint8_t repeat = static_cast<uint8_t>(Min(ND_ROW_REPEAT_CHUNK, rowCount - rowStart));
-            const uint32_t rowOffset = rowStart * colCount;
-            const uint32_t divisorOffset = rowStart * broadcastBlockSize;
-            uint32_t colOffset = 0;
-            for (; colOffset + simdSize <= colCount; colOffset += simdSize) {
-                AscendC::Div(dst[rowOffset + colOffset],
-                             src0[rowOffset + colOffset],
-                             src1[divisorOffset],
-                             simdSize,
-                             repeat,
-                             params);
-            }
-            if (colOffset < colCount) {
-                AscendC::Div(dst[rowOffset + colOffset],
-                             src0[rowOffset + colOffset],
-                             src1[divisorOffset],
-                             colCount - colOffset,
-                             repeat,
-                             params);
-            }
-        }
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
 private:
@@ -2157,6 +2190,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::CO1> scoreL0CBuf;
     AscendC::TBuf<AscendC::TPosition::A1> probL1Buf;
     AscendC::TBuf<AscendC::TPosition::A1> valueL1Buf;
+    AscendC::TBuf<AscendC::TPosition::A1> kvReuseL1Buf;
     AscendC::TBuf<AscendC::TPosition::VECCALC> ubBuf;
     bool ubLayoutValid = false;
     AscendC::LocalTensor<DTYPE_QUERY> queryL1;
@@ -2201,6 +2235,8 @@ private:
     AscendC::LocalTensor<half> probL1Pong;
     AscendC::LocalTensor<DTYPE_VCACHE> valueL1Ping;
     AscendC::LocalTensor<DTYPE_VCACHE> valueL1Pong;
+    AscendC::LocalTensor<DTYPE_KCACHE> kvReuseKeyL1;
+    AscendC::LocalTensor<DTYPE_VCACHE> kvReuseValueL1;
 
     AscendC::GlobalTensor<DTYPE_QUERY> queryGm;
     AscendC::GlobalTensor<DTYPE_QUERY> queryNzGm;
@@ -2213,6 +2249,9 @@ private:
     AscendC::GlobalTensor<DTYPE_OUTPUT> outputGm;
     const PagedAttentionMixV3TilingData *tilingData;
     uint32_t qBlockRows;
+    uint32_t kvReuseCacheTileCount = 0;
+    uint32_t kvReuseKeyTileElements = 0;
+    uint32_t kvReuseValueTileElements = 0;
 };
 
 
