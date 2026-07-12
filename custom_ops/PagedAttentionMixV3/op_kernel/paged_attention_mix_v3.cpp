@@ -108,21 +108,55 @@ public:
         const uint32_t pageSize = tilingData->pageSize;
         const uint32_t pageNumPerBatch = tilingData->pageNumPerBatch;
         const uint32_t gqaGroupSize = tilingData->gqaGroupSize;
+        const uint32_t kvTileSize = Min(pageSize, KV_TILE_SIZE);
+        const uint32_t tilesPerPage = CeilDiv(pageSize, kvTileSize);
+        const uint32_t keyPhysicalPageStride = pageSize * tilingData->kvHeadNum * qkHeadSize;
+        const uint32_t valuePhysicalPageStride = pageSize * tilingData->kvHeadNum * vHeadSize;
+        const uint32_t keyGroupStride = pageSize * qkHeadSize;
+        const uint32_t valueGroupStride = pageSize * vHeadSize;
+        const uint32_t outputTokenStride = qHeadNum * vHeadSize;
 
         uint32_t totalTaskNum = 0;
+        uint64_t totalTaskWeight = 0;
         for (uint32_t batchIdx = 0; batchIdx < tilingData->batchSize; ++batchIdx) {
             const uint32_t seqLen = static_cast<uint32_t>(seqLenGm.GetValue(batchIdx));
-            totalTaskNum += CeilDiv(seqLen, qBlockRows) * qHeadNum;
+            const uint32_t kvLen = static_cast<uint32_t>(kvLengthsGm.GetValue(batchIdx));
+            const uint32_t qSliceNum = CeilDiv(seqLen, qBlockRows);
+            totalTaskNum += qSliceNum * qHeadNum;
+            totalTaskWeight += GetPerHeadTaskWeight(seqLen,
+                                                    kvLen,
+                                                    pageSize,
+                                                    kvTileSize,
+                                                    tilesPerPage) * qHeadNum;
         }
-        if (totalTaskNum == 0) {
+        if (totalTaskNum == 0 || totalTaskWeight == 0) {
             return;
         }
 
-        // task划分
-        const uint32_t taskNumPerCore = totalTaskNum / usedCoreNum;
-        const uint32_t tailTaskNum = totalTaskNum % usedCoreNum;
-        uint32_t taskIdStart = coreIdx * taskNumPerCore + Min(coreIdx, tailTaskNum);
-        uint32_t taskIdEnd = taskIdStart + taskNumPerCore + (coreIdx < tailTaskNum ? 1U : 0U);
+        // P9A: keep each core's task range contiguous, but split by estimated
+        // work instead of task count. A task pays one fixed-cost unit plus one
+        // unit for every visible KV tile. This preserves the existing
+        // batch->qHead->qSlice order and KV-reuse locality while avoiding the
+        // large imbalance between short-context and long-context tasks.
+        const uint64_t weightPerCore = totalTaskWeight / usedCoreNum;
+        const uint64_t weightRemainder = totalTaskWeight % usedCoreNum;
+        const uint64_t targetWeightStart =
+            weightPerCore * coreIdx + weightRemainder * coreIdx / usedCoreNum;
+        const uint32_t nextCoreIdx = coreIdx + 1;
+        const uint64_t targetWeightEnd =
+            weightPerCore * nextCoreIdx + weightRemainder * nextCoreIdx / usedCoreNum;
+        uint32_t taskIdStart = FindWeightedTaskBoundary(targetWeightStart,
+                                                        qHeadNum,
+                                                        pageSize,
+                                                        kvTileSize,
+                                                        tilesPerPage,
+                                                        totalTaskNum);
+        uint32_t taskIdEnd = FindWeightedTaskBoundary(targetWeightEnd,
+                                                      qHeadNum,
+                                                      pageSize,
+                                                      kvTileSize,
+                                                      tilesPerPage,
+                                                      totalTaskNum);
         if (taskIdStart >= taskIdEnd) {
             return;
         }
@@ -153,6 +187,11 @@ public:
         uint32_t qSliceIdx = taskInBatch % qSliceNum;
         uint32_t qBlockStart = qSliceIdx * qBlockRows;
         uint32_t groupIdx = qHeadIdx / gqaGroupSize;
+        uint32_t qHeadInGroup = qHeadIdx - groupIdx * gqaGroupSize;
+        uint32_t keyGroupBase = groupIdx * keyGroupStride;
+        uint32_t valueGroupBase = groupIdx * valueGroupStride;
+        uint32_t qHeadOutputOffset = qHeadIdx * vHeadSize;
+        uint32_t blockTableBatchOffset = batchIdx * pageNumPerBatch;
 
         /****************** PrimeSingleBufferFlags(); ******************/ 
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(Pingflag);
@@ -197,21 +236,30 @@ public:
             const uint32_t realQBlockRows = Min(qBlockRows, seqLen - qBlockStart);
             {
                 constexpr uint32_t curGqaTileSize = 1;
-                const uint32_t mActual = realQBlockRows * curGqaTileSize;
-                const uint32_t roundM = RoundUp(mActual, CUBE_BLOCK_SIZE);
+                const uint32_t mActual = realQBlockRows;
+                const uint32_t roundM = (mActual + CUBE_BLOCK_SIZE - 1) & ~(CUBE_BLOCK_SIZE - 1);
                 const uint32_t qTokenStart = qBatchOffset + qBlockStart;
                 const uint32_t qHeadStart = qHeadIdx;
                 // The first visible KV tile overwrites O/l/m, so no vector init is needed here.
 
-                const uint32_t visibleKvEnd = historyKvLen + qBlockStart + realQBlockRows;
-                const uint32_t kvTileSize = Min(pageSize, KV_TILE_SIZE);
-                const uint32_t tilesPerPage = CeilDiv(pageSize, kvTileSize);
+                const uint32_t qHistoryStart = historyKvLen + qBlockStart;
+                const uint32_t visibleKvEnd = qHistoryStart + realQBlockRows;
                 const uint32_t totalKvTiles = kvPageNum * tilesPerPage;
-                const uint32_t maskRowOffset = (qBatchOffset + qBlockStart) * CUBE_BLOCK_SIZE;
-                const uint32_t blockTableBatchOffset = batchIdx * pageNumPerBatch;
+                const uint32_t maskRowOffset = qTokenStart * CUBE_BLOCK_SIZE;
+                const uint32_t outputOffset = qTokenStart * outputTokenStride + qHeadOutputOffset;
                 uint32_t cursorPageIdx = 0;
                 uint32_t cursorTileStartInPage = 0;
                 bool queryGuardConsumed = false;
+
+                if (!kvReuseOwnerValid && kvReuseCacheTileCount != 0) {
+                    kvReuseOwnerValid = true;
+                    kvReuseOwnerBatch = batchIdx;
+                    kvReuseOwnerGroup = groupIdx;
+                }
+                const bool isKvReuseOwner = kvReuseOwnerValid &&
+                                            batchIdx == kvReuseOwnerBatch &&
+                                            groupIdx == kvReuseOwnerGroup;
+
                 for (uint32_t tilePairStart = 0; tilePairStart < totalKvTiles; tilePairStart += 2) {
                     KvTileInfo pingTile;
                     if (!BuildKvTileInfoAtPosition(pingTile,
@@ -246,14 +294,6 @@ public:
                                             pageSize);
                     }
 
-                    if (!kvReuseOwnerValid && kvReuseCacheTileCount != 0) {
-                        kvReuseOwnerValid = true;
-                        kvReuseOwnerBatch = batchIdx;
-                        kvReuseOwnerGroup = groupIdx;
-                    }
-                    const bool isKvReuseOwner = kvReuseOwnerValid &&
-                                                batchIdx == kvReuseOwnerBatch &&
-                                                groupIdx == kvReuseOwnerGroup;
                     const bool usePingKvReuse = isKvReuseOwner &&
                                                 tilePairStart < kvReuseCacheTileCount;
                     const uint32_t pingKvReuseBit = usePingKvReuse ? (1U << tilePairStart) : 0U;
@@ -273,9 +313,20 @@ public:
                     }
 
                     /****** ATB: Bmm1 Ping Start ******/
-                    queryGuardConsumed = queryGuardConsumed || pingTile.isFirstKvTile;
-                    Bmm1PingSingle(pingTile.isFirstKvTile,
-                                   pingTile.isFirstKvTile,
+                    const bool isFirstKvTile = tilePairStart == 0;
+                    queryGuardConsumed = queryGuardConsumed || isFirstKvTile;
+                    const bool loadPingKvFromGm = !usePingKvReuse || fillPingKvReuse;
+                    uint32_t pingKeyOffset = 0;
+                    uint32_t pingValueOffset = 0;
+                    if (loadPingKvFromGm) {
+                        const uint32_t physicalPageIdx = static_cast<uint32_t>(
+                            blockTableGm.GetValue(pingTile.blockTableOffset));
+                        const uint32_t tileOffset = pingTile.tileStartInPage * CUBE_BLOCK_SIZE;
+                        pingKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase + tileOffset;
+                        pingValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase + tileOffset;
+                    }
+                    Bmm1PingSingle(isFirstKvTile,
+                                   isFirstKvTile,
                                    hasPongTile,
                                    qTokenStart,
                                    qHeadStart,
@@ -285,19 +336,28 @@ public:
                                    qkHeadSize,
                                    curGqaTileSize,
                                    pingTile.maskOffset,
-                                   pingTile.physicalPageIdx,
-                                   groupIdx,
+                                   pingKeyOffset,
+                                   pingValueOffset,
                                    pageSize,
-                                   pingTile.tileStartInPage,
                                    pingTile.tileSize,
                                    vHeadSize,
                                    usePingKvReuse,
-                                   fillPingKvReuse,
+                                   loadPingKvFromGm,
                                    tilePairStart);
                     if (hasPongTile) {
+                        const bool loadPongKvFromGm = !usePongKvReuse || fillPongKvReuse;
+                        uint32_t pongKeyOffset = 0;
+                        uint32_t pongValueOffset = 0;
+                        if (loadPongKvFromGm) {
+                            const uint32_t physicalPageIdx = static_cast<uint32_t>(
+                                blockTableGm.GetValue(pongTile.blockTableOffset));
+                            const uint32_t tileOffset = pongTile.tileStartInPage * CUBE_BLOCK_SIZE;
+                            pongKeyOffset = physicalPageIdx * keyPhysicalPageStride + keyGroupBase + tileOffset;
+                            pongValueOffset = physicalPageIdx * valuePhysicalPageStride + valueGroupBase + tileOffset;
+                        }
                         /****** ATB: Bmm1 Pong Starts ******/
                         Bmm1PongSingle(false,
-                                       pingTile.isFirstKvTile,
+                                       isFirstKvTile,
                                        false,
                                        qTokenStart,
                                        qHeadStart,
@@ -307,14 +367,13 @@ public:
                                        qkHeadSize,
                                        curGqaTileSize,
                                        pongTile.maskOffset,
-                                       pongTile.physicalPageIdx,
-                                       groupIdx,
+                                       pongKeyOffset,
+                                       pongValueOffset,
                                        pageSize,
-                                       pongTile.tileStartInPage,
                                        pongTile.tileSize,
                                        vHeadSize,
                                        usePongKvReuse,
-                                       fillPongKvReuse,
+                                       loadPongKvFromGm,
                                        pongTileIdx);
                     }
 
@@ -323,14 +382,14 @@ public:
                     // Softmax Ping -> Softmax Pong (optional) -> Update Ping -> Update Pong (optional).
                     // Mask is written by MTE1, while PV is written by MTE2; both are consumed by V.
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
-                    SoftmaxPingSingle(historyKvLen + qBlockStart,
+                    SoftmaxPingSingle(qHistoryStart,
                                       pingTile.tilePageStart,
                                       realQBlockRows,
                                       mActual,
                                       roundM,
                                       curGqaTileSize,
                                       pingTile.tileSize,
-                                      pingTile.isFirstKvTile);
+                                      isFirstKvTile);
                     if (hasPongTile) {
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
                         /****** ATB: Softmax Pong Starts ******/
@@ -341,14 +400,14 @@ public:
                             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
                             outputReusePending = false;
                         }
-                        SoftmaxPongSingle(historyKvLen + qBlockStart,
+                        SoftmaxPongSingle(qHistoryStart,
                                           pongTile.tilePageStart,
                                           realQBlockRows,
                                           mActual,
                                           roundM,
                                           curGqaTileSize,
                                           pongTile.tileSize,
-                                          pongTile.isFirstKvTile);
+                                          false);
                     }
                     // The next owner is always Update Ping, whose L0C->UB copy uses MTE2.
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
@@ -375,7 +434,7 @@ public:
                     UpdatePingSingle(mActual,
                                      roundM,
                                      vHeadSize,
-                                     pingTile.isFirstKvTile);     //* 更新UB，同时累加到总out上
+                                     isFirstKvTile);     //* 更新UB，同时累加到总out上
                     if (hasPongTile) {
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(SharedUbFlag);
                         /****** ATB: Update Pong Starts ******/
@@ -383,7 +442,7 @@ public:
                         UpdatePongSingle(mActual,
                                          roundM,
                                          vHeadSize,
-                                         pongTile.isFirstKvTile);     //* 更新UB，同时累加到总out上
+                                         false);     //* 更新UB，同时累加到总out上
                     }
                     // Every pair hands the arena back to the next Softmax Ping mask load.
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE1>(SharedUbFlag);
@@ -404,8 +463,7 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(OutputReuseFlag);
                     outputReusePending = false;
                 }
-                NormalizeAndWriteOutput((qBatchOffset + qBlockStart) * qHeadNum * vHeadSize +         //* 此时得到了总l，因此处理l得到最终的输出
-                                            qHeadIdx * vHeadSize,
+                NormalizeAndWriteOutput(outputOffset,         //* 此时得到了总l，因此处理l得到最终的输出
                                         mActual,
                                         roundM,
                                         qHeadNum,
@@ -426,14 +484,26 @@ public:
             qBlockStart = 0;
             ++qHeadIdx;
             if (qHeadIdx < qHeadNum) {
-                groupIdx = qHeadIdx / gqaGroupSize;
+                qHeadOutputOffset += vHeadSize;
+                ++qHeadInGroup;
+                if (qHeadInGroup == gqaGroupSize) {
+                    qHeadInGroup = 0;
+                    ++groupIdx;
+                    keyGroupBase += keyGroupStride;
+                    valueGroupBase += valueGroupStride;
+                }
                 continue;
             }
 
             qHeadIdx = 0;
             groupIdx = 0;
+            qHeadInGroup = 0;
+            keyGroupBase = 0;
+            valueGroupBase = 0;
+            qHeadOutputOffset = 0;
             qBatchOffset += seqLen;
             ++batchIdx;
+            blockTableBatchOffset += pageNumPerBatch;
             if (batchIdx >= tilingData->batchSize) {
                 // return;
                 break;
@@ -480,18 +550,115 @@ public:
 
 private:
     struct KvTileInfo {
-        uint32_t pageIdxInSeq;
         uint32_t tileStartInPage;
         uint32_t tileSize;
         uint32_t tilePageStart;
         uint32_t maskOffset;
-        int32_t physicalPageIdx;
-        bool isFirstKvTile;
+        uint32_t blockTableOffset;
     };
 
     __aicore__ inline uint32_t CeilDiv(uint32_t lhs, uint32_t rhs) const
     {
         return (lhs + rhs - 1) / rhs;
+    }
+
+    __aicore__ inline uint64_t GetSliceTaskWeight(uint32_t seqLen,
+                                                    uint32_t kvLen,
+                                                    uint32_t qSliceIdx,
+                                                    uint32_t pageSize,
+                                                    uint32_t kvTileSize,
+                                                    uint32_t tilesPerPage) const
+    {
+        const uint32_t qBlockStart = qSliceIdx * qBlockRows;
+        const uint32_t realQBlockRows = Min(qBlockRows, seqLen - qBlockStart);
+        const uint32_t visibleKvEnd = kvLen - seqLen + qBlockStart + realQBlockRows;
+        const uint32_t fullPageNum = visibleKvEnd / pageSize;
+        const uint32_t tailInPage = visibleKvEnd - fullPageNum * pageSize;
+        const uint32_t visibleKvTileCount =
+            fullPageNum * tilesPerPage +
+            (tailInPage == 0 ? 0U : CeilDiv(tailInPage, kvTileSize));
+        // One unit represents fixed per-task work (Q load, normalize and ND
+        // write); the remaining units track BMM/softmax/update work per tile.
+        return static_cast<uint64_t>(visibleKvTileCount) + 1U;
+    }
+
+    __aicore__ inline uint64_t GetPerHeadTaskWeight(uint32_t seqLen,
+                                                      uint32_t kvLen,
+                                                      uint32_t pageSize,
+                                                      uint32_t kvTileSize,
+                                                      uint32_t tilesPerPage) const
+    {
+        const uint32_t qSliceNum = CeilDiv(seqLen, qBlockRows);
+        uint64_t perHeadWeight = 0;
+        for (uint32_t qSliceIdx = 0; qSliceIdx < qSliceNum; ++qSliceIdx) {
+            perHeadWeight += GetSliceTaskWeight(seqLen,
+                                                kvLen,
+                                                qSliceIdx,
+                                                pageSize,
+                                                kvTileSize,
+                                                tilesPerPage);
+        }
+        return perHeadWeight;
+    }
+
+    __aicore__ inline uint32_t FindWeightedTaskBoundary(uint64_t targetWeight,
+                                                           uint32_t qHeadNum,
+                                                           uint32_t pageSize,
+                                                           uint32_t kvTileSize,
+                                                           uint32_t tilesPerPage,
+                                                           uint32_t totalTaskNum)
+    {
+        if (targetWeight == 0) {
+            return 0;
+        }
+
+        uint64_t weightBeforeBatch = 0;
+        uint32_t taskBase = 0;
+        for (uint32_t batchIdx = 0; batchIdx < tilingData->batchSize; ++batchIdx) {
+            const uint32_t seqLen = static_cast<uint32_t>(seqLenGm.GetValue(batchIdx));
+            const uint32_t kvLen = static_cast<uint32_t>(kvLengthsGm.GetValue(batchIdx));
+            const uint32_t qSliceNum = CeilDiv(seqLen, qBlockRows);
+            const uint64_t perHeadWeight = GetPerHeadTaskWeight(seqLen,
+                                                               kvLen,
+                                                               pageSize,
+                                                               kvTileSize,
+                                                               tilesPerPage);
+            const uint64_t batchWeight = perHeadWeight * qHeadNum;
+            const uint32_t batchTaskNum = qSliceNum * qHeadNum;
+            if (targetWeight > weightBeforeBatch + batchWeight) {
+                weightBeforeBatch += batchWeight;
+                taskBase += batchTaskNum;
+                continue;
+            }
+
+            const uint64_t targetInBatch = targetWeight - weightBeforeBatch;
+            const uint32_t qHeadIdx = static_cast<uint32_t>(targetInBatch / perHeadWeight);
+            if (qHeadIdx >= qHeadNum) {
+                return taskBase + batchTaskNum;
+            }
+
+            const uint64_t targetInHead = targetInBatch - perHeadWeight * qHeadIdx;
+            uint64_t weightBeforeSlice = 0;
+            const uint32_t headTaskBase = taskBase + qHeadIdx * qSliceNum;
+            for (uint32_t qSliceIdx = 0; qSliceIdx < qSliceNum; ++qSliceIdx) {
+                const uint64_t sliceWeight = GetSliceTaskWeight(seqLen,
+                                                               kvLen,
+                                                               qSliceIdx,
+                                                               pageSize,
+                                                               kvTileSize,
+                                                               tilesPerPage);
+                const uint64_t weightAfterSlice = weightBeforeSlice + sliceWeight;
+                if (targetInHead <= weightAfterSlice) {
+                    const uint64_t distanceToPrevious = targetInHead - weightBeforeSlice;
+                    const uint64_t distanceToNext = weightAfterSlice - targetInHead;
+                    return headTaskBase + qSliceIdx +
+                           (distanceToNext < distanceToPrevious ? 1U : 0U);
+                }
+                weightBeforeSlice = weightAfterSlice;
+            }
+            return headTaskBase + qSliceNum;
+        }
+        return totalTaskNum;
     }
 
     __aicore__ inline uint32_t Min(uint32_t lhs, uint32_t rhs) const
@@ -535,15 +702,12 @@ private:
             return false;
         }
 
-        const uint32_t maskColBlock = tilePageStart / CUBE_BLOCK_SIZE;
-
-        tileInfo.pageIdxInSeq = pageIdxInSeq;
         tileInfo.tileStartInPage = tileStartInPage;
         tileInfo.tileSize = Min(kvTileSize, pageSize - tileStartInPage);
         tileInfo.tilePageStart = tilePageStart;
-        tileInfo.maskOffset = maskColBlock * tilingData->maskRowSize * CUBE_BLOCK_SIZE + maskRowOffset;
-        tileInfo.physicalPageIdx = blockTableGm.GetValue(blockTableBatchOffset + pageIdxInSeq);
-        tileInfo.isFirstKvTile = pageIdxInSeq == 0 && tileStartInPage == 0;
+        tileInfo.maskOffset =
+            ((tilePageStart >> 4) * tilingData->maskRowSize << 4) + maskRowOffset;
+        tileInfo.blockTableOffset = blockTableBatchOffset + pageIdxInSeq;
         return true;
     }
 
@@ -774,17 +938,11 @@ private:
     }
 
     __aicore__ inline void CopyKeyToL1(AscendC::LocalTensor<DTYPE_KCACHE> dstKeyL1,
-                                       int32_t physicalPageIdx,
-                                       uint32_t groupIdx,
+                                       uint32_t pageOffset,
                                        uint32_t fullPageSize,
-                                       uint32_t tileStartInPage,
                                        uint32_t tileSize,
                                        uint32_t qkHeadSize)
     {
-        const uint32_t hiddenOffset = groupIdx * qkHeadSize;
-        const uint32_t pageOffset =
-            static_cast<uint32_t>(physicalPageIdx) * fullPageSize * tilingData->kvHeadNum * qkHeadSize +
-            hiddenOffset * fullPageSize + tileStartInPage * CUBE_BLOCK_SIZE;
         const uint16_t burstCount = static_cast<uint16_t>(qkHeadSize / CUBE_BLOCK_SIZE);
         const uint16_t srcGap = static_cast<uint16_t>(fullPageSize - tileSize);
         AscendC::DataCopy(dstKeyL1,
@@ -866,14 +1024,13 @@ private:
                                           uint32_t qkHeadSize,
                                           uint32_t gqaGroupSize,
                                           uint32_t maskOffset,
-                                          int32_t physicalPageIdx,
-                                          uint32_t groupIdx,
+                                          uint32_t keyPageOffset,
+                                          uint32_t valuePageOffset,
                                           uint32_t fullPageSize,
-                                          uint32_t tileStartInPage,
                                           uint32_t tileSize,
                                           uint32_t vHeadSize,
                                           bool useKvReuse,
-                                          bool fillKvReuse,
+                                          bool loadKvFromGm,
                                           uint32_t kvReuseTileIdx)
     {
         /****** ATB: Bmm1 Ping / QK LOAD + Mask PRELOAD + V PRELOAD ******/
@@ -889,14 +1046,13 @@ private:
                    qkHeadSize,
                    gqaGroupSize,
                    maskOffset,
-                   physicalPageIdx,
-                   groupIdx,
+                   keyPageOffset,
+                   valuePageOffset,
                    fullPageSize,
-                   tileStartInPage,
                    tileSize,
                    vHeadSize,
                    useKvReuse,
-                   fillKvReuse,
+                   loadKvFromGm,
                    kvReuseTileIdx,
                    Pingflag,
                    PingflagPlus2,
@@ -921,14 +1077,13 @@ private:
                                           uint32_t qkHeadSize,
                                           uint32_t gqaGroupSize,
                                           uint32_t maskOffset,
-                                          int32_t physicalPageIdx,
-                                          uint32_t groupIdx,
+                                          uint32_t keyPageOffset,
+                                          uint32_t valuePageOffset,
                                           uint32_t fullPageSize,
-                                          uint32_t tileStartInPage,
                                           uint32_t tileSize,
                                           uint32_t vHeadSize,
                                           bool useKvReuse,
-                                          bool fillKvReuse,
+                                          bool loadKvFromGm,
                                           uint32_t kvReuseTileIdx)
     {
         /****** ATB: Bmm1 Pong / QK LOAD + Mask PRELOAD + V PRELOAD ******/
@@ -944,14 +1099,13 @@ private:
                    qkHeadSize,
                    gqaGroupSize,
                    maskOffset,
-                   physicalPageIdx,
-                   groupIdx,
+                   keyPageOffset,
+                   valuePageOffset,
                    fullPageSize,
-                   tileStartInPage,
                    tileSize,
                    vHeadSize,
                    useKvReuse,
-                   fillKvReuse,
+                   loadKvFromGm,
                    kvReuseTileIdx,
                    Pongflag,
                    PongflagPlus2,
@@ -977,14 +1131,13 @@ private:
                                       uint32_t qkHeadSize,
                                       uint32_t gqaGroupSize,
                                       uint32_t maskOffset,
-                                      int32_t physicalPageIdx,
-                                      uint32_t groupIdx,
+                                      uint32_t keyPageOffset,
+                                      uint32_t valuePageOffset,
                                       uint32_t fullPageSize,
-                                      uint32_t tileStartInPage,
                                       uint32_t tileSize,
                                       uint32_t vHeadSize,
                                       bool useKvReuse,
-                                      bool fillKvReuse,
+                                      bool loadKvFromGm,
                                       uint32_t kvReuseTileIdx,
                                       decltype(Pingflag) mainFlag,
                                       decltype(Pingflag) plus2Flag,
@@ -1029,12 +1182,10 @@ private:
             keyL1Source = kvReuseKeyL1[kvReuseTileIdx * kvReuseKeyTileElements];
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(plus4Flag);
-        if (!useKvReuse || fillKvReuse) {
+        if (loadKvFromGm) {
             CopyKeyToL1(keyL1Source,
-                        physicalPageIdx,
-                        groupIdx,
+                        keyPageOffset,
                         fullPageSize,
-                        tileStartInPage,
                         tileSize,
                         qkHeadSize);
         }
@@ -1053,12 +1204,10 @@ private:
             valueL1Source = kvReuseValueL1[kvReuseTileIdx * kvReuseValueTileElements];
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(plus6Flag);
-        if (!useKvReuse || fillKvReuse) {
+        if (loadKvFromGm) {
             CopyValueToL1(valueL1Source,
-                          physicalPageIdx,
-                          groupIdx,
+                          valuePageOffset,
                           fullPageSize,
-                          tileStartInPage,
                           tileSize,
                           vHeadSize);
         }
@@ -2046,22 +2195,15 @@ private:
     }
 
     __aicore__ inline void CopyValueToL1(AscendC::LocalTensor<DTYPE_VCACHE> dstValueL1,
-                                         int32_t physicalPageIdx,
-                                         uint32_t groupIdx,
+                                         uint32_t pageOffset,
                                          uint32_t fullPageSize,
-                                         uint32_t tileStartInPage,
                                          uint32_t tileSize,
                                          uint32_t vHeadSize)
     {
-        const uint32_t hiddenOffset = groupIdx * vHeadSize;
-        const uint32_t vPageOffset =
-            static_cast<uint32_t>(physicalPageIdx) * fullPageSize * tilingData->kvHeadNum * vHeadSize +
-            hiddenOffset * fullPageSize +
-            tileStartInPage * CUBE_BLOCK_SIZE;
         const uint16_t burstCount = static_cast<uint16_t>(vHeadSize / CUBE_BLOCK_SIZE);
         const uint16_t srcGap = static_cast<uint16_t>(fullPageSize - tileSize);
         AscendC::DataCopy(dstValueL1,
-                          vCacheGm[vPageOffset],
+                          vCacheGm[pageOffset],
                           AscendC::DataCopyParams(burstCount,
                                                   static_cast<uint16_t>(tileSize),
                                                   srcGap,
