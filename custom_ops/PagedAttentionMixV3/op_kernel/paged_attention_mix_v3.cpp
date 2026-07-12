@@ -1831,6 +1831,69 @@ private:
         AscendC::Sub<half, false>(dst, src0, src1, (uint64_t)0, repeat, params);
     }
 
+    __aicore__ inline void SetHalfVectorMaskByCount(uint32_t elementCount)
+    {
+        const uint64_t lowMask = elementCount >= 64
+                                     ? (uint64_t)-1
+                                     : (((uint64_t)1 << elementCount) - 1);
+        const uint32_t highCount = elementCount > 64 ? elementCount - 64 : 0;
+        const uint64_t highMask = highCount == 0
+                                      ? (uint64_t)0
+                                      : (((uint64_t)1 << highCount) - 1);
+        AscendC::SetVectorMask<int8_t>(highMask, lowMask);
+    }
+
+    __aicore__ inline void DivC0BlocksHalf(AscendC::LocalTensor<half> dst,
+                                           AscendC::LocalTensor<half> divisor,
+                                           uint32_t rowCount,
+                                           uint32_t rowStride,
+                                           uint32_t colCount)
+    {
+        // One fp16 vector repeat covers eight [row][C0] rows. Issue the full
+        // repeats explicitly for each V block so the compiler does not expand
+        // eight generic count-mode Div calls. A non-eight-row tail is shared
+        // by all V blocks in one masked multi-repeat, matching ATB's tail path.
+        constexpr uint32_t ROWS_PER_REPEAT = HALFS_PER_VECTOR_REPEAT / CUBE_BLOCK_SIZE;
+        const uint32_t fullRows = rowCount / ROWS_PER_REPEAT * ROWS_PER_REPEAT;
+        const uint8_t fullRepeat = static_cast<uint8_t>(fullRows / ROWS_PER_REPEAT);
+        const uint32_t colBlockCount = colCount / CUBE_BLOCK_SIZE;
+
+        if (fullRepeat != 0) {
+            const AscendC::BinaryRepeatParams fullParams(1, 1, 1, 8, 8, 8);
+            for (uint32_t colBlock = 0; colBlock < colBlockCount; ++colBlock) {
+                const uint32_t blockOffset = colBlock * rowStride * CUBE_BLOCK_SIZE;
+                AscendC::Div<half, false>(dst[blockOffset],
+                                          dst[blockOffset],
+                                          divisor,
+                                          (uint64_t)0,
+                                          fullRepeat,
+                                          fullParams);
+            }
+        }
+
+        const uint32_t tailRows = rowCount - fullRows;
+        if (tailRows != 0) {
+            const uint32_t tailElements = tailRows * CUBE_BLOCK_SIZE;
+            SetHalfVectorMaskByCount(tailElements);
+            const uint32_t tailOffset = fullRows * CUBE_BLOCK_SIZE;
+            const AscendC::BinaryRepeatParams tailParams(
+                1,
+                1,
+                1,
+                static_cast<uint8_t>(rowStride),
+                static_cast<uint8_t>(rowStride),
+                0);
+            AscendC::Div<half, false>(dst[tailOffset],
+                                      dst[tailOffset],
+                                      divisor[tailOffset],
+                                      (uint64_t)0,
+                                      static_cast<uint8_t>(colBlockCount),
+                                      tailParams);
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
     __aicore__ inline void RepeatReduceSumFloat(AscendC::LocalTensor<float> dst,
                                                 AscendC::LocalTensor<float> src,
                                                 uint8_t repeat,
@@ -2382,15 +2445,11 @@ private:
         CastFloatToHalfChunked(outF16Ub, outUb, roundM * vHeadSize);
         AscendC::PipeBarrier<PIPE_V>();
 
-        for (uint32_t colStart = 0; colStart < vHeadSize; colStart += CUBE_BLOCK_SIZE) {
-            const uint32_t blockOffset = colStart * roundM;
-            const uint32_t blockElements = mActual * CUBE_BLOCK_SIZE;
-            AscendC::Div(outF16Ub[blockOffset],
-                         outF16Ub[blockOffset],
-                         workF16Ub,
-                         blockElements);
-        }
-        AscendC::PipeBarrier<PIPE_V>();
+        DivC0BlocksHalf(outF16Ub,
+                        workF16Ub,
+                        mActual,
+                        roundM,
+                        vHeadSize);
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
