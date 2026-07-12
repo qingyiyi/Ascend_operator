@@ -1,173 +1,338 @@
-# PagedAttentionMixV3 测试文档
+# PagedAttentionMixV3 测试与 Profiler 文档
 
-本文记录当前自研 `PagedAttentionMixV3` 与 ATB `_npu_paged_attention_splitfuse` 的测试环境准备、测试方法、正确性判断方式，以及一次固定规模下的 profiler 对比结果。
+本文按 **2026-07-12 当前代码**记录自研 `PagedAttentionMixV3` 与 ATB `torch_npu._npu_paged_attention_splitfuse` 的：
 
-## 0. 拉取测试仓库
-在宿主机上拉取测试仓库：
+- 环境准备和运行方式；
+- 当前 11 组正确性回归；
+- 单 Shape Profiler 复现方法；
+- `profiler_attention_final67` 的 10 次平均数据；
+- 自研 Kernel 与 ATB attention core / comparable chain 的对比口径。
+
+> 本版主表和主性能结论固定来自 `profiler_attention_final67`，不与其他 Profiler 轮次混算。跨快照趋势会单独标注。结果只代表该代码快照、CANN/ATB 软件栈、Ascend 310P 设备和固定 Shape，不应直接外推到其他环境。本次只整理已有 CSV，没有重新运行 NPU Profiler。
+
+## 1. 测试环境准备
+
+### 1.1 拉取仓库
+
 ```bash
-cd ~/var/
+cd ~/var
 git clone --recurse-submodules https://github.com/qingyiyi/Ascend_operator.git
+cd Ascend_operator
 ```
 
-## 1. 创建 Docker 测试环境
+### 1.2 Docker 示例
 
-在宿主机上创建测试容器。用户目录只挂载 `~`，容器内映射为 `/root`，因此后续在容器中拉取的 `~/var/Ascend_operator` 会对应宿主机的 `$HOME/var/Ascend_operator`。
+以下是现有测试环境使用过的容器配置。宿主机 `$HOME/var/Ascend_operator` 映射到容器 `/root/var/Ascend_operator`：
 
 ```bash
 CROSSING_DOCKER_IMAGE=crossing_npu_benchmark:310p-aarch64-8.3.RC2-b92ca26
 CONTAINER_NAME=dev_test
 
 docker run -d --net=host --ipc=host \
-        --name $CONTAINER_NAME \
-        --hostname huawei-arm-01 \
-        --runtime ascend \
-        --privileged \
-        --ulimit stack=67108864 \
-        --ulimit memlock=-1 \
-        -u root \
-        --device /dev/davinci_manager \
-        --device /dev/hisi_hdc \
-        --device /dev/devmm_svm \
-        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-        -v /usr/local/dcmi:/usr/local/dcmi \
-        -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-        -v /var/queue_schedule:/var/queue_schedule \
-        -v /usr/bin/hccn_tool:/usr/bin/hccn_tool \
-        -v /etc/hccn.conf:/etc/hccn.conf \
-        -v $HOME/var/Ascend_operator:/root/var/Ascend_operator \
-        $CROSSING_DOCKER_IMAGE \
-        tail -f /dev/null
+  --name "${CONTAINER_NAME}" \
+  --hostname huawei-arm-01 \
+  --runtime ascend \
+  --privileged \
+  --ulimit stack=67108864 \
+  --ulimit memlock=-1 \
+  -u root \
+  --device /dev/davinci_manager \
+  --device /dev/hisi_hdc \
+  --device /dev/devmm_svm \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /var/queue_schedule:/var/queue_schedule \
+  -v /usr/bin/hccn_tool:/usr/bin/hccn_tool \
+  -v /etc/hccn.conf:/etc/hccn.conf \
+  -v "$HOME/var/Ascend_operator:/root/var/Ascend_operator" \
+  "${CROSSING_DOCKER_IMAGE}" \
+  tail -f /dev/null
+
+docker exec -it "${CONTAINER_NAME}" bash
 ```
 
-进入容器：
+如果 CANN、ATB、设备节点或镜像版本不同，需要相应修改。
 
-```bash
-docker exec -it $CONTAINER_NAME bash
-```
+## 2. 当前 `run.sh` 的真实行为
 
-## 2. 如何运行
-
-在测试目录执行下面命令即可开始测试：
+执行：
 
 ```bash
 cd ~/var/Ascend_operator/test_op
 bash run.sh
 ```
 
-`run.sh` 当前会先编译自定义算子，然后执行：
+脚本会先构建和安装 `PagedAttentionMixV3`，重建 PyTorch 扩展，再运行 `test_attention.py`。
+
+会运行命令：
+
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1 PROFILE_TARGET=both PROFILE_REPEAT=10 python test_attention.py
 ```
 
-一次运行会同时 profile：
+## 3. 当前正确性回归
 
-- `mix_v3`：自研 `torch.ops.npu.paged_attention_mix_v3`
-- `atb_splitfuse`：ATB `torch_npu._npu_paged_attention_splitfuse`
-
-profile 输出默认写到：
+`test_op/test_attention.py::main()` 当前共有 11 个用例，均使用：
 
 ```text
-profiler_attention/
+Hq = 32
+Hkv = 4
+Dq = Dv = 128
+page_size = 128
+GQA group size = 8
 ```
 
-## 3. 当前测试规模
+| # | Batch | 总 Q token | `seq_lengths_host` | `kv_lengths_host` | 覆盖目标 |
+|---:|---:|---:|---|---|---|
+| 1 | 2 | 256 | `[128, 128]` | `[128, 128]` | 两个完整 128-row slice、单 KV tile |
+| 2 | 2 | 256 | `[64, 192]` | `[80, 432]` | 主 Profile Shape、多 KV tile |
+| 3 | 2 | 256 | `[63, 193]` | `[80, 432]` | 非 16 对齐 Q 尾块 |
+| 4 | 2 | 256 | `[127, 129]` | `[160, 432]` | 127/128/1 边界 |
+| 5 | 2 | 256 | `[129, 127]` | `[432, 160]` | 反向 Batch 顺序的边界覆盖 |
+| 6 | 2 | 256 | `[1, 255]` | `[80, 432]` | 一行尾块与 128+127 |
+| 7 | 2 | 256 | `[17, 239]` | `[80, 432]` | 小尾块与多 slice |
+| 8 | 1 | 1 | `[1]` | `[1]` | Decode：单 Q、单 KV token |
+| 9 | 1 | 1 | `[1]` | `[128]` | Decode：单 KV page |
+| 10 | 1 | 1 | `[1]` | `[512]` | Decode：多 KV page |
+| 11 | 2 | 2 | `[1, 1]` | `[80, 432]` | 多 Batch Decode |
 
-`test_attention.py` 当前主测试用例是：
+### 3.1 Q 的当前布局
+
+测试侧原始 Q 为 ND：
+
+```text
+[T, Hq, Dq]
+```
+
+传给自研算子前执行：
 
 ```python
-test_paged_attention(2, 256, 512, 32, 4, 128, 128, [64, 192], [80, 432])
+query_head_major = query_nd.permute(1, 0, 2).contiguous()
+query_nz = torch_npu.npu_format_cast(query_head_major, 29)
 ```
 
-对应含义：
+因此自研接口接收的是 **head-major Q**，逻辑 Shape 为：
 
-| 参数 | 数值 | 含义 |
-|---|---:|---|
-| `num_batches` | 2 | batch 数 |
-| `batch_seq_len` | 256 | 总 Q token 数 |
-| `batch_kv_len` | 512 | 最大 KV 长度参考值 |
-| `num_heads` | 32 | Q head 数 |
-| `num_kv_heads` | 4 | KV head 数 |
-| `head_size` | 128 | Q/K head dim |
-| `page_size` | 128 | 每个 KV page 的 token 数 |
-| `seq_lengths_host` | `[64, 192]` | 两个 batch 的 Q 长度 |
-| `kv_lengths_host` | `[80, 432]` | 两个 batch 的 KV 长度 |
+```text
+[Hq, T, Dq]
+```
 
-该规模下：
+物理 token stride 为 `RoundUp(T, 16)`。长度 Tensor 仍保存逻辑 token 数，不保存 NZ padding 后长度。
 
-- GQA group size = `num_heads / num_kv_heads = 8`
-- Q/K head dim = 128
-- page size = 128
-- batch0 使用 1 个 KV page，batch1 使用 4 个 KV page
+### 3.2 通过判据
 
-## 4. 正确性验证
+每个用例都会比较：
 
-正确性通过时，输出里应出现：
+```text
+自研：torch.ops.npu.paged_attention_mix_v3
+参考：torch_npu._npu_paged_attention_splitfuse
+```
+
+通过时输出：
 
 ```text
 ========== compare mix_v3 vs splitfuse ==========
 mix_v3 vs splitfuse Pass!
 ```
 
-这里的比较关系是：
-
-- 自研输出：`run_mix_v3()`
-- ATB 参考输出：`run_splitfuse()`
-- 比较函数：`compare_outputs("mix_v3", out_mix_v3, out_splitfuse, ref_name="splitfuse")`
-
-## 5. Profile 数据来源
-
-本文的 profile 快照来自：
+当前 `diff_tensor.py` 的判据为：
 
 ```text
-profiler_attention_final47
+max(abs(actual - reference))
+------------------------------------ < 0.1
+max(abs(reference)) + 1e-6
 ```
 
-具体 CSV：
+### 3.3 必须检查 11 条 Pass
+
+`compare_outputs()` 遇到 NaN 或误差超阈值时只打印诊断，不会主动抛异常。因此 Python 进程退出码为 0 不代表全部正确。
+
+推荐：
+
+```bash
+cd test_op
+set -o pipefail
+
+ASCEND_RT_VISIBLE_DEVICES=1 \
+PROFILE_TARGET=none \
+TEST_REPEAT=1 \
+python test_attention.py | tee test_attention.log
+
+PASS_COUNT="$(grep -c 'mix_v3 vs splitfuse Pass!' test_attention.log || true)"
+test "${PASS_COUNT}" -eq 11 || {
+  echo "Expected 11 passing cases, got ${PASS_COUNT}"
+  exit 1
+}
+```
+
+## 4. 单 Shape Profiler 复现
+
+不建议直接对 `main()` 的 11 个用例全部采集，因为 trace 文件名固定为：
 
 ```text
-profiler_attention_final47/mix_v3_tb/huawei-arm-01_1232180_20260708070835129_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv
-profiler_attention_final47/atb_splitfuse_tb/huawei-arm-01_1232180_20260708070843513_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv
+mix_v3.json
+atb_splitfuse.json
 ```
 
-统计方式：
+连续用例可能覆盖同名 trace。推荐直接调用固定 Shape：
 
-- 两边都取 `PROFILE_REPEAT=10` 的 10 次 kernel 记录。
-- 表格里的数值为 10 次平均值，单位为 `us`。
-- ATB profiler 中会出现 `TransdataNdToNzKernel`，但该 kernel 不计入本文的可比链路。当前自研路径的 Q 输入已经在 Python 侧按 grouped-NZ 物理顺序准备好，因此对齐比较时不应把 ATB 内部的 Q `ND -> NZ` 转换时间算进去。
-- 本文的 “ATB comparable chain” 只包含 3 个 kernel：`MulsF16Kernel + PagedAttentionDecoderNzMaskKernel + TransdataNzToNdKernel`。
-- “ATB comparable chain” 是把每次 repeat 的这 3 个 kernel duration 相加后再平均；各部件耗时也是按这 3 个 kernel 的字段算术求和，仅用于观察可比链路成本。
+```bash
+cd ~/var/Ascend_operator/test_op
+rm -rf profiler_attention
 
-## 6. Kernel 级别平均耗时
+ASCEND_RT_VISIBLE_DEVICES=1 \
+PROFILE_TARGET=both \
+PROFILE_REPEAT=10 \
+PROFILE_WARMUP=3 \
+PROFILE_LEVEL=1 \
+PROFILE_DIR=profiler_attention \
+python - <<'PY'
+from test_attention import test_paged_attention
+
+test_paged_attention(
+    2,
+    256,
+    512,
+    32,
+    4,
+    128,
+    128,
+    [64, 192],
+    [80, 432],
+)
+PY
+```
+
+固定 Shape 含义：
+
+| 参数 | 数值 | 含义 |
+|---|---:|---|
+| `num_batches` | 2 | Batch 数 |
+| `batch_seq_len` | 256 | 总 Q token 数 |
+| `batch_kv_len` | 512 | 测试输入的最大 KV 长度参考值 |
+| `num_heads` | 32 | Q head 数 |
+| `num_kv_heads` | 4 | KV head 数 |
+| `head_size` | 128 | Q/K/V head dim |
+| `page_size` | 128 | KV page token 数 |
+| `seq_lengths_host` | `[64, 192]` | 两个请求的 Q 长度 |
+| `kv_lengths_host` | `[80, 432]` | 两个请求的 KV 长度 |
+
+该用例还对应：
+
+```text
+num_blocks = 5
+block_table shape = [2, 5]
+output shape = [256, 32, 128]
+自研 Block Dim = 8
+```
+
+## 5. final67 数据来源
+
+记录数量：
+
+- 自研 `PagedAttentionMixV313`：10 条；
+- ATB `TransdataNdToNzKernel`：10 条；
+- ATB `MulsF16Kernel`：10 条；
+- ATB `PagedAttentionDecoderNzMaskKernel`：10 条；
+- ATB `TransdataNzToNdKernel`：10 条。
+
+表中所有数据均为 10 次算术平均，单位为 `us`；`Cube Util` 单位为百分比。
+
+本轮两个 Profile 的 `profiler_info.json` 均记录：
+
+```text
+CANN = 8.3.RC2
+torch_npu = 2.1.0.post13
+AI Core metric = ACL_AICORE_PIPE_UTILIZATION
+```
+
+## 6. 对比口径
+
+ATB 调用中包含：
+
+```text
+TransdataNdToNzKernel
+MulsF16Kernel
+PagedAttentionDecoderNzMaskKernel
+TransdataNzToNdKernel
+```
+
+主对比排除 `TransdataNdToNzKernel`，原因是：
+
+- 自研算子接口本身要求 Q 已经是 head-major NZ；
+- 测试代码在调用自研算子前已完成 Q 的 `permute + npu_format_cast(..., 29)`；
+- 若把 ATB 内部 Q `ND -> NZ` 计入，而不计自研调用侧对应预处理，会造成接口边界不一致。
+
+因此本文定义：
+
+```text
+ATB comparable chain
+= MulsF16Kernel
++ PagedAttentionDecoderNzMaskKernel
++ TransdataNzToNdKernel
+```
+
+ATB comparable chain 的 `Duration` 是三个 Kernel 平均 Duration 的和。AI Core、Vector、MAC、Scalar、MTE1/2/3 也按三个 Kernel 的平均字段做算术求和，仅用于观察该链路的组成；`Cube Util` 采用 attention core 的值，不对百分比求和。
+
+## 7. Kernel 级别 10 次平均
+
+| Kernel | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 自研 `PagedAttentionMixV313` | 264.3550 | 221.1140 | 200.1891 | 20.4551 | 58.3758 | 24.6347 | 21.1559 | 6.8537 | 83.6430% |
+| ATB `TransdataNdToNzKernel` | 11.0790 | 9.5560 | 2.1463 | 0.0000 | 2.3183 | 0.0000 | 3.7145 | 3.8688 | 0.0000% |
+| ATB `MulsF16Kernel` | 5.7921 | 4.9260 | 0.9461 | 0.0000 | 0.5908 | 0.0000 | 3.2510 | 2.3835 | 0.0000% |
+| ATB `PagedAttentionDecoderNzMaskKernel` | 301.3717 | 204.9550 | 193.4048 | 20.4251 | 41.9992 | 22.1796 | 19.3874 | 5.8998 | 68.0074% |
+| ATB `TransdataNzToNdKernel` | 16.1370 | 12.9420 | 5.4988 | 0.0000 | 3.0660 | 0.0000 | 5.1964 | 3.3656 | 0.0000% |
+
+## 8. ATB comparable chain
 
 | 项目 | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 自研 `PagedAttentionMixV312` | 363.707 | 239.207 | 205.319 | 19.317 | 45.598 | 15.037 | 16.792 | 5.980 | 65.769% |
-| ATB `TransdataNdToNzKernel` | 10.936 | 9.501 | 2.146 | 0.000 | 2.317 | 0.000 | 3.649 | 3.931 | 0.000% |
-| ATB `MulsF16Kernel` | 5.771 | 4.949 | 0.946 | 0.000 | 0.591 | 0.000 | 3.255 | 2.392 | 0.000% |
-| ATB `PagedAttentionDecoderNzMaskKernel` | 301.197 | 204.938 | 193.406 | 20.424 | 42.090 | 22.177 | 19.383 | 5.928 | 68.041% |
-| ATB `TransdataNzToNdKernel` | 16.038 | 12.917 | 5.499 | 0.000 | 3.063 | 0.000 | 5.228 | 3.385 | 0.000% |
+| ATB comparable chain | 323.3008 | 222.8230 | 199.8497 | 20.4251 | 45.6560 | 22.1796 | 27.8348 | 11.6489 | 68.0074% |
 
-## 7. ATB 可比链路平均耗时
+如果把 ATB 的 Q `ND -> NZ` 也计入，ATB 四 Kernel 全链路平均 Duration 为：
 
-| 项目 | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
+```text
+334.3798 us
+```
+
+该值仅作为补充，不作为本文主对比。
+
+## 9. 自研与 ATB attention core
+
+### 9.1 Duration
+
+```text
+自研：264.3550 us
+ATB attention core：301.3717 us
+差值：-37.0167 us
+耗时降低：12.2827%
+Speedup：1.1400×
+```
+
+### 9.2 各字段差值
+
+| 自研 - ATB attention core | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ATB comparable chain | 323.006 | 222.804 | 199.851 | 20.424 | 45.744 | 22.177 | 27.866 | 11.705 | 68.041% |
+| 差值 | -37.0167 | +16.1590 | +6.7843 | +0.0300 | +16.3766 | +2.4551 | +1.7685 | +0.9539 | +15.6356 个百分点 |
 
-注意：
+注意：虽然自研 wall-clock Duration 更低，但部分 Pipe 指标更高。这些指标在 Kernel 内可以并行重叠，不能作为串行阶段直接相加，也不能仅凭单个 Pipe 时间判断最终 Duration。
 
-- `ATB comparable chain = MulsF16Kernel + PagedAttentionDecoderNzMaskKernel + TransdataNzToNdKernel`。
-- `TransdataNdToNzKernel` 不计入可比链路。
+## 10. 自研与 ATB comparable chain
 
-## 8. 自研与 ATB 差值
+### 10.1 Duration
 
-自研单 kernel 相对 ATB attention core：
+```text
+自研：264.3550 us
+ATB comparable chain：323.3008 us
+差值：-58.9458 us
+耗时降低：18.2325%
+Speedup：1.2230×
+```
 
-| 差值：自研 - ATB core | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
+### 10.2 各字段差值
+
+| 自研 - ATB comparable chain | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `PagedAttentionMixV312 - PagedAttentionDecoderNzMaskKernel` | +62.510 | +34.269 | +11.913 | -1.107 | +3.508 | -7.141 | -2.591 | +0.052 | -2.272% |
-
-自研单 kernel 相对 ATB comparable chain：
-
-| 差值：自研 - ATB comparable chain | Duration | AI Core | Vector | Cube/MAC | Scalar | MTE1 | MTE2 | MTE3 | Cube Util |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `PagedAttentionMixV312 - ATB comparable chain` | +40.701 | +16.403 | +5.468 | -1.107 | -0.146 | -7.140 | -11.074 | -5.725 | -2.272% |
+| 差值 | -58.9458 | -1.7090 | +0.3394 | +0.0300 | +12.7198 | +2.4551 | -6.6789 | -4.7952 | +15.6356 个百分点 |
