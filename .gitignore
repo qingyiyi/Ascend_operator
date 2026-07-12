@@ -3,6 +3,7 @@
 
 # 保留 .gitignore 本身
 !/.gitignore
+!/README.md
 !/paged_attention_mix_v3测试文档.md
 !/paged_attention_mix_v3开发文档.md
 
