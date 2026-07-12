@@ -105,6 +105,7 @@ public:
         const uint32_t qHeadNum = tilingData->qHeadNum;
         const uint32_t qkHeadSize = tilingData->qkHeadSize;
         const uint32_t vHeadSize = tilingData->vHeadSize;
+        const uint32_t outputTokenStride = qHeadNum * vHeadSize;
         const uint32_t pageSize = tilingData->pageSize;
         const uint32_t pageNumPerBatch = tilingData->pageNumPerBatch;
         const uint32_t gqaGroupSize = tilingData->gqaGroupSize;
@@ -114,7 +115,6 @@ public:
         const uint32_t valuePhysicalPageStride = pageSize * tilingData->kvHeadNum * vHeadSize;
         const uint32_t keyGroupStride = pageSize * qkHeadSize;
         const uint32_t valueGroupStride = pageSize * vHeadSize;
-        const uint32_t outputTokenStride = qHeadNum * vHeadSize;
 
         uint32_t totalTaskNum = 0;
         uint64_t totalTaskWeight = 0;
@@ -980,6 +980,31 @@ private:
         // is not equivalent to the already-validated NZ->ZZ path in this AscendC
         // implementation when the whole invocation contains only one Q row.
 
+        // P10A: a per-q-head task has one head in this path.  Physical NZ stores
+        // consecutive K/C0 blocks with physicalTokenRows between them, while L1
+        // stores the same blocks with roundM between them.  Express that as one
+        // multi-burst GM->L1 copy instead of issuing one DataCopy per K block.
+        // This matches ATB's prefill Q-load geometry and removes repeated MTE2
+        // command setup without changing either the GM or L1 layout.
+        const uint32_t srcKBlockStride = physicalTokenRows - realQBlockRows;
+        const uint32_t dstKBlockStride = roundM - realQBlockRows;
+        if (gqaTileSize == 1 &&
+            qkHeadBlocks <= DATA_COPY_PARAM_LIMIT &&
+            realQBlockRows <= DATA_COPY_PARAM_LIMIT &&
+            srcKBlockStride <= DATA_COPY_PARAM_LIMIT &&
+            dstKBlockStride <= DATA_COPY_PARAM_LIMIT) {
+            const uint32_t srcOffset = qHeadStart * headStride + qTokenStart * CUBE_BLOCK_SIZE;
+            AscendC::DataCopy(queryL1,
+                              queryNzGm[srcOffset],
+                              AscendC::DataCopyParams(static_cast<uint16_t>(qkHeadBlocks),
+                                                      static_cast<uint16_t>(realQBlockRows),
+                                                      static_cast<uint16_t>(srcKBlockStride),
+                                                      static_cast<uint16_t>(dstKBlockStride)));
+            return;
+        }
+
+        // Retain the general folded-head/large-stride geometry even though the
+        // current per-q-head task mapping normally takes the coalesced path.
         for (uint32_t kBlock = 0; kBlock < qkHeadBlocks; ++kBlock) {
             for (uint32_t tileHead = 0; tileHead < gqaTileSize; ++tileHead) {
                 const uint32_t qHeadId = qHeadStart + tileHead;

@@ -4,17 +4,15 @@
 #include <cstdint>
 #include <limits>
 #include <cstdio>
-#include <algorithm>
 
 #include "exe_graph/runtime/tiling_context.h"
 #include "tiling/platform/platform_ascendc.h"
 
 namespace {
 constexpr uint32_t CUBE_BLOCK_SIZE = 16;
-constexpr uint32_t MAX_Q_ROWS_PER_GROUP = 128;
-constexpr uint32_t MAX_GQA_TILE_SIZE = 8;
 constexpr uint32_t MAX_GQA_GROUP_SIZE = 16;
 constexpr uint32_t NZ_C0_SIZE = 16;
+constexpr uint32_t Q_BLOCK_ROWS = 128;
 
 template <typename T>
 bool MissingConstTensor(const gert::Tensor *tensor)
@@ -34,14 +32,6 @@ void SetWorkspace(gert::TilingContext *context)
     if (currentWorkspace != nullptr) {
         currentWorkspace[0] = ascendcPlatform->GetLibApiWorkSpaceSize();
     }
-}
-
-uint32_t CalcQBlockRows(uint32_t gqaGroupSize)
-{
-    const uint32_t gqaTileSize = std::min(gqaGroupSize, MAX_GQA_TILE_SIZE);
-    uint32_t qBlockRows = MAX_Q_ROWS_PER_GROUP / gqaTileSize;
-    qBlockRows = qBlockRows / CUBE_BLOCK_SIZE * CUBE_BLOCK_SIZE;
-    return qBlockRows == 0 ? CUBE_BLOCK_SIZE : qBlockRows;
 }
 
 } // namespace
@@ -216,7 +206,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
   if (kvLenCount < static_cast<int64_t>(batchSize)) {
     return ge::GRAPH_FAILED;
   }
-  const uint32_t qBlockRows = CalcQBlockRows(gqaGroupSize);
+  const uint32_t qBlockRows = Q_BLOCK_ROWS;
   uint64_t totalTaskNum = 0;
   for (uint32_t i = 0; i < batchSize; ++i) {
     if (kvLens[i] <= 0 || kvLens[i] > std::numeric_limits<uint32_t>::max()) {
@@ -231,7 +221,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     if (curKvPageNum > pageNumPerBatch) {
       return ge::GRAPH_FAILED;
     }
-    totalTaskNum += static_cast<uint64_t>((curSeqLen + qBlockRows - 1) / qBlockRows) * kvHeadNum;
+    totalTaskNum += static_cast<uint64_t>((curSeqLen + qBlockRows - 1) / qBlockRows) * qHeadNum;
   }
 
   static auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
