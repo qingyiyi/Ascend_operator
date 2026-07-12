@@ -2375,17 +2375,22 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         ExpandToC0BlockHalf(workF16Ub, mNewF16Ub, roundM);
 
+        // P10B: outUb is already contiguous in [vBlock][row][C0] order.
+        // Convert the complete numerator with long vector repeats before the
+        // per-C0 normalization, matching ATB's two-chunk conversion for a
+        // 128x128 output instead of issuing one short Cast per C0 block.
+        CastFloatToHalfChunked(outF16Ub, outUb, roundM * vHeadSize);
+        AscendC::PipeBarrier<PIPE_V>();
+
         for (uint32_t colStart = 0; colStart < vHeadSize; colStart += CUBE_BLOCK_SIZE) {
             const uint32_t blockOffset = colStart * roundM;
             const uint32_t blockElements = mActual * CUBE_BLOCK_SIZE;
-            CastFloatToHalfChunked(outF16Ub[blockOffset], outUb[blockOffset], blockElements);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Div(outF16Ub[blockOffset],
                          outF16Ub[blockOffset],
                          workF16Ub,
                          blockElements);
-            AscendC::PipeBarrier<PIPE_V>();
         }
+        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(Pingflag);
